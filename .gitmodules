@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "third_party/holt"]
+	path = third_party/holt
+	url = https://github.com/feichai0017/holt.git

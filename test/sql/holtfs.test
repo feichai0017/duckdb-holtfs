@@ -1,0 +1,15 @@
+# name: test/sql/holtfs.test
+# description: holtfs extension smoke test
+# group: [holtfs]
+
+require holtfs
+
+query I
+SELECT length(holtfs_version()) > 0;
+----
+true
+
+statement error
+SELECT * FROM holt_files('/tmp/holtfs-index', delimiter := '//');
+----
+Binder Error: holtfs delimiter must be empty or a single byte
