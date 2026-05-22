@@ -15,9 +15,25 @@ include_directories(src/include)
 set(HOLT_ROOT "${CMAKE_CURRENT_LIST_DIR}/third_party/holt"
     CACHE PATH "Path to a Holt checkout containing crates/holt-ffi")
 set(HOLT_FFI_INCLUDE_DIR "${HOLT_ROOT}/crates/holt-ffi/include")
+set(HOLT_CARGO_ARGS build -p holt-ffi --release --locked)
 
 if(WIN32)
   set(HOLT_FFI_LIBRARY "${HOLT_ROOT}/target/release/holt_ffi.lib")
+elseif(APPLE AND OSX_BUILD_ARCH STREQUAL "x86_64")
+  find_program(RUSTUP_EXECUTABLE rustup)
+  if(NOT RUSTUP_EXECUTABLE)
+    message(FATAL_ERROR "rustup is required to cross-build holt-ffi for x86_64-apple-darwin")
+  endif()
+  execute_process(
+    COMMAND ${RUSTUP_EXECUTABLE} target add x86_64-apple-darwin
+    RESULT_VARIABLE HOLT_RUSTUP_RESULT
+    OUTPUT_VARIABLE HOLT_RUSTUP_OUTPUT
+    ERROR_VARIABLE HOLT_RUSTUP_ERROR)
+  if(NOT HOLT_RUSTUP_RESULT EQUAL 0)
+    message(FATAL_ERROR "failed to install Rust target x86_64-apple-darwin:\n${HOLT_RUSTUP_OUTPUT}\n${HOLT_RUSTUP_ERROR}")
+  endif()
+  list(APPEND HOLT_CARGO_ARGS --target x86_64-apple-darwin)
+  set(HOLT_FFI_LIBRARY "${HOLT_ROOT}/target/x86_64-apple-darwin/release/libholt_ffi.a")
 else()
   set(HOLT_FFI_LIBRARY "${HOLT_ROOT}/target/release/libholt_ffi.a")
 endif()
@@ -31,7 +47,7 @@ if(NOT CARGO_EXECUTABLE)
   message(FATAL_ERROR "cargo is required to build holt-ffi")
 endif()
 execute_process(
-  COMMAND ${CARGO_EXECUTABLE} build -p holt-ffi --release --locked
+  COMMAND ${CARGO_EXECUTABLE} ${HOLT_CARGO_ARGS}
   WORKING_DIRECTORY "${HOLT_ROOT}"
   RESULT_VARIABLE HOLT_FFI_BUILD_RESULT
   OUTPUT_VARIABLE HOLT_FFI_BUILD_OUTPUT

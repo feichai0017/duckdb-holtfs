@@ -40,6 +40,10 @@ warm-cache discovery latency for native glob vs Holt scans.
 
 See [`RESULTS.md`](RESULTS.md) for a local reference run.
 
+`holtfs_validate` is intentionally not part of the latency comparison.
+Validation walks the source namespace and is the correctness check for a
+snapshot index, not the accelerated discovery path.
+
 ## Interpreting Results
 
 Use this benchmark to answer one narrow question:

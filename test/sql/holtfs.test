@@ -20,6 +20,11 @@ SELECT * FROM holt_files('missing_memory_index', mode := 'memory');
 IO Error: holtfs memory index not found: missing_memory_index
 
 statement error
+SELECT * FROM holtfs_validate('test/fixtures/holtfs', '/tmp/duckdb_holtfs_sql_index', mode := 'bad');
+----
+Binder Error: holtfs mode must be 'persistent' or 'memory'
+
+statement error
 SELECT *
 FROM holtfs_index('test/fixtures/holtfs',
                   mode := 'persistent',
@@ -58,6 +63,20 @@ FROM holt_files('/tmp/duckdb_holtfs_sql_index',
 ----
 test/fixtures/holtfs/bucket/table/date=2026-05-22/part-000.parquet	1
 
+query IIIIIII
+SELECT CAST(source_exists AS INTEGER),
+       CAST(source_files AS INTEGER),
+       CAST(indexed_files AS INTEGER),
+       CAST(matched_files AS INTEGER),
+       CAST(changed_files AS INTEGER),
+       CAST(missing_files AS INTEGER),
+       CAST(is_current AS INTEGER)
+FROM holtfs_validate('test/fixtures/holtfs',
+                     '/tmp/duckdb_holtfs_sql_index',
+                     mode := 'persistent');
+----
+1	3	3	3	0	0	1
+
 query I
 SELECT indexed_files
 FROM holtfs_index('test/fixtures/holtfs/bucket/table/date=2026-05-22',
@@ -75,6 +94,18 @@ FROM holt_files('/tmp/duckdb_holtfs_sql_index',
 ----
 0
 
+query IIIII
+SELECT CAST(indexed_files AS INTEGER),
+       CAST(matched_files AS INTEGER),
+       CAST(changed_files AS INTEGER),
+       CAST(missing_files AS INTEGER),
+       CAST(is_current AS INTEGER)
+FROM holtfs_validate('test/fixtures/holtfs',
+                     '/tmp/duckdb_holtfs_sql_index',
+                     mode := 'persistent');
+----
+1	1	0	2	0
+
 query I
 SELECT indexed_files
 FROM holtfs_index('test/fixtures/holtfs',
@@ -91,3 +122,14 @@ FROM holt_files('fixture_memory',
                 prefix := 'test/fixtures/holtfs/bucket/table/');
 ----
 3
+
+query IIII
+SELECT CAST(source_files AS INTEGER),
+       CAST(indexed_files AS INTEGER),
+       CAST(matched_files AS INTEGER),
+       CAST(is_current AS INTEGER)
+FROM holtfs_validate('test/fixtures/holtfs',
+                     'fixture_memory',
+                     mode := 'memory');
+----
+3	3	3	1

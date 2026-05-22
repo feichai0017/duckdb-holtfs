@@ -37,6 +37,11 @@ FROM holt_files('table_cache',
                 mode := 'memory',
                 prefix := '/lake/table/',
                 delimiter := '/');
+
+SELECT *
+FROM holtfs_validate('/lake/table',
+                     'table_cache',
+                     mode := 'memory');
 ```
 
 `holt_files` returns:
@@ -134,9 +139,33 @@ FROM holt_files('table_cache',
                 prefix := '/data/lake/table/');
 ```
 
-`refresh := 'replace'` is exact: an existing persistent index directory
-is removed before rebuilding, and an existing memory index name is
-atomically replaced. This avoids stale keys when files disappear.
+Validate whether a snapshot index still matches the current filesystem
+metadata:
+
+```sql
+SELECT source_files,
+       indexed_files,
+       changed_files,
+       missing_files,
+       deleted_files,
+       is_current
+FROM holtfs_validate('/data/lake/table',
+                     '/var/cache/duckdb/table.holt',
+                     mode := 'persistent');
+```
+
+`holtfs_validate` compares the source tree against indexed
+`size=<bytes>;kind=file;mtime_us=<epoch-micros>` records. `missing_files`
+means the source has files absent from Holt, `deleted_files` means Holt
+still has keys whose files disappeared, and `changed_files` means the
+indexed size or mtime no longer matches.
+
+`refresh := 'replace'` is exact. A memory index name is atomically
+replaced after the fresh tree is built. A persistent index is first built
+in a temporary sibling path and only then published over the old path, so
+index build failures leave the previous index intact. This avoids stale
+keys when files disappear; automatic watchers and incremental refresh are
+not exposed yet.
 
 ## Scope
 
@@ -146,6 +175,8 @@ This repository is intentionally narrow:
   indexes regular files from a local path into Holt.
 - `holt_files(index_ref, mode := ...)` lists an existing Holt metadata
   index through Holt's C ABI.
+- `holtfs_validate(source_path, index_ref, mode := ...)` checks whether a
+  snapshot index is current against local file size and mtime.
 - Direct Parquet delegation is the next step; it is not exposed as a
   placeholder SQL function.
 
