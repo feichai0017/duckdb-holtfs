@@ -5,16 +5,24 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "holt_ffi.h"
 
+#include <algorithm>
+#include <cctype>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace duckdb {
 
 namespace {
+
+enum class IndexMode : uint8_t { PERSISTENT, MEMORY };
 
 static string HoltfsVersionString() {
 #ifdef EXT_VERSION_HOLTFS
@@ -29,24 +37,78 @@ static void HoltfsVersionFunction(DataChunk &, ExpressionState &, Vector &result
 	result.SetValue(0, Value(HoltfsVersionString()));
 }
 
-struct HoltfsFilesBindData : public TableFunctionData {
-	string index_path;
-	string prefix;
-	string delimiter;
-	string start_after;
-	idx_t max_files = 0;
-	bool include_value = false;
-};
+static string LowerAscii(string value) {
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+	return value;
+}
+
+static IndexMode ParseMode(const string &value) {
+	auto normalized = LowerAscii(value);
+	if (normalized == "persistent") {
+		return IndexMode::PERSISTENT;
+	}
+	if (normalized == "memory") {
+		return IndexMode::MEMORY;
+	}
+	throw BinderException("holtfs mode must be 'persistent' or 'memory'");
+}
+
+static const char *ModeName(IndexMode mode) {
+	return mode == IndexMode::PERSISTENT ? "persistent" : "memory";
+}
+
+static void ParseRefreshMode(const string &value) {
+	if (LowerAscii(value) != "replace") {
+		throw BinderException("holtfs refresh must be 'replace'");
+	}
+}
 
 struct HoltTreeHandle {
+	explicit HoltTreeHandle(HoltTree *tree) : tree(tree) {
+	}
+
 	~HoltTreeHandle() {
 		if (tree) {
 			holt_tree_close(tree);
 		}
 	}
 
-	HoltTree *tree = nullptr;
+	HoltTreeHandle(const HoltTreeHandle &) = delete;
+	HoltTreeHandle &operator=(const HoltTreeHandle &) = delete;
+
+	HoltTree *tree;
 };
+
+using HoltTreeRef = std::shared_ptr<HoltTreeHandle>;
+
+class MemoryIndexRegistry {
+public:
+	void Publish(const string &name, HoltTreeRef handle) {
+		if (name.empty()) {
+			throw BinderException("holtfs memory index requires name");
+		}
+		std::lock_guard<std::mutex> lock(mu);
+		indexes[name] = handle;
+	}
+
+	HoltTreeRef Get(const string &name) {
+		std::lock_guard<std::mutex> lock(mu);
+		auto entry = indexes.find(name);
+		if (entry == indexes.end()) {
+			throw IOException("holtfs memory index not found: " + name);
+		}
+		return entry->second;
+	}
+
+private:
+	std::mutex mu;
+	std::unordered_map<string, HoltTreeRef> indexes;
+};
+
+static MemoryIndexRegistry &MemoryIndexes() {
+	static MemoryIndexRegistry registry;
+	return registry;
+}
 
 static string HoltfsLastError(const char *op) {
 	auto msg = holt_last_error_message();
@@ -56,12 +118,24 @@ static string HoltfsLastError(const char *op) {
 	return string(op) + " failed: " + msg;
 }
 
+struct HoltfsFilesBindData : public TableFunctionData {
+	string index_ref;
+	IndexMode mode = IndexMode::PERSISTENT;
+	string prefix;
+	string delimiter;
+	string start_after;
+	idx_t max_files = 0;
+	bool include_value = false;
+};
+
 static void ReadFilesNamedParameters(TableFunctionBindInput &input, HoltfsFilesBindData &result) {
 	for (auto &kv : input.named_parameters) {
 		if (kv.second.IsNull()) {
 			throw BinderException("holtfs named parameters cannot be NULL");
 		}
-		if (kv.first == "prefix") {
+		if (kv.first == "mode") {
+			result.mode = ParseMode(StringValue::Get(kv.second));
+		} else if (kv.first == "prefix") {
 			result.prefix = StringValue::Get(kv.second);
 		} else if (kv.first == "delimiter") {
 			result.delimiter = StringValue::Get(kv.second);
@@ -85,11 +159,11 @@ static void ReadFilesNamedParameters(TableFunctionBindInput &input, HoltfsFilesB
 static unique_ptr<FunctionData> HoltfsFilesBind(ClientContext &, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs.size() != 1) {
-		throw BinderException("holt_files(index_path, ...) expects exactly one VARCHAR argument");
+		throw BinderException("holt_files(index_ref, ...) expects exactly one VARCHAR argument");
 	}
 
 	auto result = make_uniq<HoltfsFilesBindData>();
-	result->index_path = StringValue::Get(input.inputs[0]);
+	result->index_ref = StringValue::Get(input.inputs[0]);
 	ReadFilesNamedParameters(input, *result);
 
 	names.emplace_back("entry_type");
@@ -109,12 +183,17 @@ struct HoltfsFilesGlobalState : public GlobalTableFunctionState {
 		if (iter) {
 			holt_iter_close(iter);
 		}
-		if (tree) {
-			holt_tree_close(tree);
+		if (owned_tree) {
+			holt_tree_close(owned_tree);
 		}
 	}
 
-	HoltTree *tree = nullptr;
+	HoltTree *Tree() {
+		return memory_tree ? memory_tree->tree : owned_tree;
+	}
+
+	HoltTree *owned_tree = nullptr;
+	HoltTreeRef memory_tree;
 	HoltIter *iter = nullptr;
 	idx_t emitted = 0;
 };
@@ -141,17 +220,22 @@ static unique_ptr<GlobalTableFunctionState> HoltfsFilesInit(ClientContext &, Tab
 	auto &bind = input.bind_data->CastNoConst<HoltfsFilesBindData>();
 	auto state = make_uniq<HoltfsFilesGlobalState>();
 
-	if (holt_tree_open_with_wal_commit(bind.index_path.c_str(), HOLT_WAL_ENQUEUE, &state->tree) != HOLT_OK) {
-		throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
+	if (bind.mode == IndexMode::PERSISTENT) {
+		if (holt_tree_open_with_wal_commit(bind.index_ref.c_str(), HOLT_WAL_ENQUEUE, &state->owned_tree) != HOLT_OK) {
+			throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
+		}
+	} else {
+		state->memory_tree = MemoryIndexes().Get(bind.index_ref);
 	}
 
 	auto prefix = reinterpret_cast<const uint8_t *>(bind.prefix.data());
 	auto start_after = OptionalData(bind.start_after);
 	auto start_after_len = OptionalSize(bind.start_after);
 	auto delimiter = DelimiterByte(bind);
-	auto rc = bind.include_value ? holt_tree_scan_records(state->tree, prefix, bind.prefix.size(), delimiter,
-	                                                      start_after, start_after_len, &state->iter)
-	                             : holt_tree_scan_keys(state->tree, prefix, bind.prefix.size(), delimiter, start_after,
+	auto tree = state->Tree();
+	auto rc = bind.include_value ? holt_tree_scan_records(tree, prefix, bind.prefix.size(), delimiter, start_after,
+	                                                      start_after_len, &state->iter)
+	                             : holt_tree_scan_keys(tree, prefix, bind.prefix.size(), delimiter, start_after,
 	                                                   start_after_len, &state->iter);
 	if (rc != HOLT_OK) {
 		throw IOException(HoltfsLastError(bind.include_value ? "holt_tree_scan_records" : "holt_tree_scan_keys"));
@@ -216,6 +300,7 @@ static void HoltfsFilesFunction(ClientContext &, TableFunctionInput &input, Data
 
 static void RegisterHoltFiles(ExtensionLoader &loader) {
 	TableFunction function("holt_files", {LogicalType::VARCHAR}, HoltfsFilesFunction, HoltfsFilesBind, HoltfsFilesInit);
+	function.named_parameters["mode"] = LogicalType::VARCHAR;
 	function.named_parameters["prefix"] = LogicalType::VARCHAR;
 	function.named_parameters["delimiter"] = LogicalType::VARCHAR;
 	function.named_parameters["start_after"] = LogicalType::VARCHAR;
@@ -226,26 +311,69 @@ static void RegisterHoltFiles(ExtensionLoader &loader) {
 
 struct HoltfsIndexBindData : public TableFunctionData {
 	string source_path;
+	IndexMode mode = IndexMode::PERSISTENT;
 	string index_path;
+	string name;
 };
 
 struct HoltfsIndexGlobalState : public GlobalTableFunctionState {
 	bool done = false;
 };
 
+static void ReadIndexNamedParameters(TableFunctionBindInput &input, HoltfsIndexBindData &result) {
+	for (auto &kv : input.named_parameters) {
+		if (kv.second.IsNull()) {
+			throw BinderException("holtfs named parameters cannot be NULL");
+		}
+		if (kv.first == "mode") {
+			result.mode = ParseMode(StringValue::Get(kv.second));
+		} else if (kv.first == "index_path") {
+			result.index_path = StringValue::Get(kv.second);
+		} else if (kv.first == "name") {
+			result.name = StringValue::Get(kv.second);
+		} else if (kv.first == "refresh") {
+			ParseRefreshMode(StringValue::Get(kv.second));
+		}
+	}
+}
+
+static string IndexRef(const HoltfsIndexBindData &bind) {
+	return bind.mode == IndexMode::PERSISTENT ? bind.index_path : bind.name;
+}
+
 static unique_ptr<FunctionData> HoltfsIndexBind(ClientContext &, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
-	if (input.inputs.size() != 2) {
-		throw BinderException("holtfs_index(source_path, index_path) expects two VARCHAR arguments");
+	if (input.inputs.size() != 1) {
+		throw BinderException("holtfs_index(source_path, ...) expects exactly one VARCHAR argument");
 	}
 
 	auto result = make_uniq<HoltfsIndexBindData>();
 	result->source_path = StringValue::Get(input.inputs[0]);
-	result->index_path = StringValue::Get(input.inputs[1]);
+	ReadIndexNamedParameters(input, *result);
+
+	if (result->mode == IndexMode::PERSISTENT) {
+		if (result->index_path.empty()) {
+			throw BinderException("holtfs persistent index requires index_path");
+		}
+		if (!result->name.empty()) {
+			throw BinderException("holtfs persistent index does not accept name");
+		}
+	} else {
+		if (result->name.empty()) {
+			throw BinderException("holtfs memory index requires name");
+		}
+		if (!result->index_path.empty()) {
+			throw BinderException("holtfs memory index does not accept index_path");
+		}
+	}
 
 	names.emplace_back("source_path");
 	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("index_path");
+	names.emplace_back("mode");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("index_ref");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("refresh");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("indexed_files");
 	return_types.emplace_back(LogicalType::UBIGINT);
@@ -259,8 +387,8 @@ static unique_ptr<GlobalTableFunctionState> HoltfsIndexInit(ClientContext &, Tab
 	return make_uniq<HoltfsIndexGlobalState>();
 }
 
-static string MetadataValue(uint64_t size) {
-	return "size=" + std::to_string(size) + ";kind=file";
+static string MetadataValue(uint64_t size, int64_t mtime_us) {
+	return "size=" + std::to_string(size) + ";kind=file;mtime_us=" + std::to_string(mtime_us);
 }
 
 static void IndexOneFile(FileSystem &fs, HoltTree *tree, const string &path, uint64_t &files, uint64_t &bytes) {
@@ -272,7 +400,8 @@ static void IndexOneFile(FileSystem &fs, HoltTree *tree, const string &path, uin
 
 	auto key = fs.ConvertSeparators(path);
 	auto size = static_cast<uint64_t>(file_size);
-	auto value = MetadataValue(size);
+	auto mtime_us = Timestamp::GetEpochMicroSeconds(handle->Stats().last_modification_time);
+	auto value = MetadataValue(size, mtime_us);
 	auto rc = holt_tree_put(tree, reinterpret_cast<const uint8_t *>(key.data()), key.size(),
 	                        reinterpret_cast<const uint8_t *>(value.data()), value.size());
 	if (rc != HOLT_OK) {
@@ -305,6 +434,47 @@ static void IndexPath(FileSystem &fs, HoltTree *tree, const string &source, uint
 	}
 }
 
+static void ReplacePersistentIndex(FileSystem &fs, const string &source, const string &index_path) {
+	if (source == index_path) {
+		throw IOException("holtfs index_path must differ from source_path");
+	}
+	if (index_path.size() > source.size() && index_path.compare(0, source.size(), source) == 0 &&
+	    (index_path[source.size()] == '/' || index_path[source.size()] == '\\')) {
+		throw IOException("holtfs index_path must not be inside source_path");
+	}
+	if (fs.DirectoryExists(index_path)) {
+		fs.RemoveDirectory(index_path);
+	} else if (fs.FileExists(index_path)) {
+		fs.RemoveFile(index_path);
+	}
+}
+
+static HoltTreeRef BuildMemoryIndex(FileSystem &fs, const HoltfsIndexBindData &bind, uint64_t &files, uint64_t &bytes) {
+	HoltTree *tree = nullptr;
+	if (holt_tree_open_memory(&tree) != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_open_memory"));
+	}
+	auto handle = std::make_shared<HoltTreeHandle>(tree);
+	IndexPath(fs, handle->tree, bind.source_path, files, bytes);
+	MemoryIndexes().Publish(bind.name, handle);
+	return handle;
+}
+
+static void BuildPersistentIndex(FileSystem &fs, const HoltfsIndexBindData &bind, uint64_t &files, uint64_t &bytes) {
+	ReplacePersistentIndex(fs, bind.source_path, bind.index_path);
+
+	HoltTree *tree = nullptr;
+	if (holt_tree_open_with_wal_commit(bind.index_path.c_str(), HOLT_WAL_WRITE, &tree) != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
+	}
+	HoltTreeHandle handle(tree);
+	IndexPath(fs, handle.tree, bind.source_path, files, bytes);
+
+	if (holt_tree_checkpoint(handle.tree) != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_checkpoint"));
+	}
+}
+
 static void HoltfsIndexFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind = input.bind_data->CastNoConst<HoltfsIndexBindData>();
 	auto &state = input.global_state->Cast<HoltfsIndexGlobalState>();
@@ -314,30 +484,31 @@ static void HoltfsIndexFunction(ClientContext &context, TableFunctionInput &inpu
 	}
 	state.done = true;
 
-	HoltTreeHandle handle;
-	if (holt_tree_open_with_wal_commit(bind.index_path.c_str(), HOLT_WAL_WRITE, &handle.tree) != HOLT_OK) {
-		throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
-	}
-
 	uint64_t files = 0;
 	uint64_t bytes = 0;
 	auto &fs = FileSystem::GetFileSystem(context);
-	IndexPath(fs, handle.tree, bind.source_path, files, bytes);
-
-	if (holt_tree_checkpoint(handle.tree) != HOLT_OK) {
-		throw IOException(HoltfsLastError("holt_tree_checkpoint"));
+	if (bind.mode == IndexMode::PERSISTENT) {
+		BuildPersistentIndex(fs, bind, files, bytes);
+	} else {
+		BuildMemoryIndex(fs, bind, files, bytes);
 	}
 
 	output.data[0].SetValue(0, Value(bind.source_path));
-	output.data[1].SetValue(0, Value(bind.index_path));
-	output.data[2].SetValue(0, Value::UBIGINT(files));
-	output.data[3].SetValue(0, Value::UBIGINT(bytes));
+	output.data[1].SetValue(0, Value(ModeName(bind.mode)));
+	output.data[2].SetValue(0, Value(IndexRef(bind)));
+	output.data[3].SetValue(0, Value("replace"));
+	output.data[4].SetValue(0, Value::UBIGINT(files));
+	output.data[5].SetValue(0, Value::UBIGINT(bytes));
 	output.SetCardinality(1);
 }
 
 static void RegisterHoltfsIndex(ExtensionLoader &loader) {
-	TableFunction function("holtfs_index", {LogicalType::VARCHAR, LogicalType::VARCHAR}, HoltfsIndexFunction,
-	                       HoltfsIndexBind, HoltfsIndexInit);
+	TableFunction function("holtfs_index", {LogicalType::VARCHAR}, HoltfsIndexFunction, HoltfsIndexBind,
+	                       HoltfsIndexInit);
+	function.named_parameters["mode"] = LogicalType::VARCHAR;
+	function.named_parameters["index_path"] = LogicalType::VARCHAR;
+	function.named_parameters["name"] = LogicalType::VARCHAR;
+	function.named_parameters["refresh"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(function);
 }
 

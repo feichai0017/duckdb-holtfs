@@ -6,21 +6,37 @@ It is based on DuckDB's official
 [`extension-template`](https://github.com/duckdb/extension-template).
 
 The current extension exposes local file indexing plus Holt-backed
-namespace listing:
+namespace listing. Indexes can be either persistent or in-memory:
 
 ```sql
 LOAD holtfs;
 
 SELECT *
-FROM holtfs_index('/lake/table', '/var/cache/duckdb/table.holt');
+FROM holtfs_index('/lake/table',
+                  mode := 'persistent',
+                  index_path := '/var/cache/duckdb/table.holt',
+                  refresh := 'replace');
 
 SELECT *
 FROM holt_files(
   '/var/cache/duckdb/table.holt',
+  mode := 'persistent',
   prefix := 's3://bucket/table/date=2026-05-22/',
   delimiter := '/',
   max_files := 1000
 );
+
+SELECT *
+FROM holtfs_index('/lake/table',
+                  mode := 'memory',
+                  name := 'table_cache',
+                  refresh := 'replace');
+
+SELECT *
+FROM holt_files('table_cache',
+                mode := 'memory',
+                prefix := '/lake/table/',
+                delimiter := '/');
 ```
 
 `holt_files` returns:
@@ -65,22 +81,36 @@ make GEN=ninja EXT_FLAGS="-DHOLT_ROOT=/path/to/holt"
   -c "LOAD './build/release/extension/holtfs/holtfs.duckdb_extension'; SELECT holtfs_version();"
 ```
 
-Build or refresh a local metadata index:
+Build or refresh a persistent local metadata index:
 
 ```sql
 SELECT *
 FROM holtfs_index('/data/lake/table',
-                  '/var/cache/duckdb/table.holt');
+                  mode := 'persistent',
+                  index_path := '/var/cache/duckdb/table.holt',
+                  refresh := 'replace');
+```
+
+Build an in-memory index for the current DuckDB process:
+
+```sql
+SELECT *
+FROM holtfs_index('/data/lake/table',
+                  mode := 'memory',
+                  name := 'table_cache',
+                  refresh := 'replace');
 ```
 
 The index stores regular files as `path -> metadata` records where the
-metadata payload currently contains `size=<bytes>;kind=file`.
+metadata payload currently contains
+`size=<bytes>;kind=file;mtime_us=<epoch-micros>`.
 
 Read a Holt index:
 
 ```sql
 SELECT entry_type, path, version
 FROM holt_files('/var/cache/duckdb/table.holt',
+                mode := 'persistent',
                 prefix := 's3://bucket/table/',
                 delimiter := '/');
 ```
@@ -90,17 +120,37 @@ Set `include_value := true` when the metadata payload is needed:
 ```sql
 SELECT path, value, version
 FROM holt_files('/var/cache/duckdb/table.holt',
+                mode := 'persistent',
                 prefix := 's3://bucket/table/',
                 include_value := true);
 ```
+
+Read an in-memory index by name:
+
+```sql
+SELECT entry_type, path
+FROM holt_files('table_cache',
+                mode := 'memory',
+                prefix := '/data/lake/table/');
+```
+
+`refresh := 'replace'` is exact: an existing persistent index directory
+is removed before rebuilding, and an existing memory index name is
+atomically replaced. This avoids stale keys when files disappear.
 
 ## Scope
 
 This repository is intentionally narrow:
 
-- `holtfs_index(source_path, index_path)` indexes regular files from a
-  local path into Holt.
-- `holt_files(...)` lists an existing Holt metadata index through
-  Holt's C ABI.
+- `holtfs_index(source_path, mode := ..., index_path := ... | name := ...)`
+  indexes regular files from a local path into Holt.
+- `holt_files(index_ref, mode := ...)` lists an existing Holt metadata
+  index through Holt's C ABI.
 - Direct Parquet delegation is the next step; it is not exposed as a
   placeholder SQL function.
+
+## Benchmark
+
+The benchmark under [`benchmark/`](benchmark/) compares DuckDB native
+`glob()` discovery with Holt persistent and memory scans. It measures
+metadata discovery only; it does not read Parquet payloads.

@@ -14,15 +14,33 @@ SELECT * FROM holt_files('/tmp/holtfs-index', delimiter := '//');
 ----
 Binder Error: holtfs delimiter must be empty or a single byte
 
+statement error
+SELECT * FROM holt_files('missing_memory_index', mode := 'memory');
+----
+IO Error: holtfs memory index not found: missing_memory_index
+
+statement error
+SELECT *
+FROM holtfs_index('test/fixtures/holtfs',
+                  mode := 'persistent',
+                  index_path := 'test/fixtures/holtfs/.holt',
+                  refresh := 'replace');
+----
+IO Error: holtfs index_path must not be inside source_path
+
 query I
 SELECT indexed_files
-FROM holtfs_index('test/fixtures/holtfs', '/tmp/duckdb_holtfs_sql_index');
+FROM holtfs_index('test/fixtures/holtfs',
+                  mode := 'persistent',
+                  index_path := '/tmp/duckdb_holtfs_sql_index',
+                  refresh := 'replace');
 ----
 3
 
 query TTI
 SELECT entry_type, path, CAST(version > 0 AS INTEGER)
 FROM holt_files('/tmp/duckdb_holtfs_sql_index',
+                mode := 'persistent',
                 prefix := 'test/fixtures/holtfs/bucket/table/',
                 delimiter := '/')
 ORDER BY path;
@@ -32,9 +50,44 @@ common_prefix	test/fixtures/holtfs/bucket/table/date=2026-05-22/	0
 common_prefix	test/fixtures/holtfs/bucket/table/date=2026-05-23/	0
 
 query TI
-SELECT path, CAST(CAST(value AS VARCHAR) = 'size=5;kind=file' AS INTEGER)
+SELECT path, CAST(CAST(value AS VARCHAR) LIKE 'size=5;kind=file;mtime_us=%' AS INTEGER)
 FROM holt_files('/tmp/duckdb_holtfs_sql_index',
+                mode := 'persistent',
                 prefix := 'test/fixtures/holtfs/bucket/table/date=2026-05-22/part-000.parquet',
                 include_value := true);
 ----
 test/fixtures/holtfs/bucket/table/date=2026-05-22/part-000.parquet	1
+
+query I
+SELECT indexed_files
+FROM holtfs_index('test/fixtures/holtfs/bucket/table/date=2026-05-22',
+                  mode := 'persistent',
+                  index_path := '/tmp/duckdb_holtfs_sql_index',
+                  refresh := 'replace');
+----
+1
+
+query I
+SELECT count(*)
+FROM holt_files('/tmp/duckdb_holtfs_sql_index',
+                mode := 'persistent',
+                prefix := 'test/fixtures/holtfs/bucket/table/date=2026-05-23/');
+----
+0
+
+query I
+SELECT indexed_files
+FROM holtfs_index('test/fixtures/holtfs',
+                  mode := 'memory',
+                  name := 'fixture_memory',
+                  refresh := 'replace');
+----
+3
+
+query I
+SELECT count(*)
+FROM holt_files('fixture_memory',
+                mode := 'memory',
+                prefix := 'test/fixtures/holtfs/bucket/table/');
+----
+3
