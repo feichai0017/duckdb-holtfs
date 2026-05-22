@@ -4,6 +4,8 @@
 
 require holtfs
 
+require parquet
+
 query I
 SELECT length(holtfs_version()) > 0;
 ----
@@ -216,6 +218,100 @@ FROM holt_files('fixture_memory',
                 prefix := 'test/fixtures/holtfs/bucket/table/');
 ----
 3
+
+statement ok
+COPY (SELECT 42::INTEGER AS id, 'holt'::VARCHAR AS tag)
+TO '{TEMP_DIR}/holtfs_one.parquet' (FORMAT PARQUET);
+
+query I
+SELECT indexed_files
+FROM holtfs_index('{TEMP_DIR}/holtfs_one.parquet',
+                  mode := 'persistent',
+                  index_path := '/tmp/duckdb_holtfs_parquet_index');
+----
+1
+
+query IT
+SELECT id, tag
+FROM holt_parquet_scan('/tmp/duckdb_holtfs_parquet_index',
+                       mode := 'persistent');
+----
+42	holt
+
+query I
+SELECT indexed_files
+FROM holtfs_index('{TEMP_DIR}/holtfs_one.parquet',
+                  mode := 'memory',
+                  name := 'parquet_memory');
+----
+1
+
+query I
+SELECT count(*)
+FROM holt_parquet_scan('parquet_memory',
+                       mode := 'memory',
+                       prefix := '{TEMP_DIR}/',
+                       filename := true);
+----
+1
+
+statement error
+SELECT *
+FROM holt_parquet_scan('parquet_memory',
+                       mode := 'memory',
+                       prefix := '{TEMP_DIR}/missing/');
+----
+IO Error: holt_parquet_scan found no Parquet files for prefix: {TEMP_DIR}/missing/
+
+statement ok
+COPY (
+  SELECT 1::INTEGER AS id, '2026-05-22'::VARCHAR AS ds
+  UNION ALL
+  SELECT 2::INTEGER AS id, '2026-05-23'::VARCHAR AS ds
+)
+TO '{TEMP_DIR}/holtfs_glob_lake' (FORMAT PARQUET, PARTITION_BY ds);
+
+query I
+SELECT indexed_files
+FROM holtfs_index('{TEMP_DIR}/holtfs_glob_lake/**/*.parquet',
+                  mode := 'persistent',
+                  index_path := '/tmp/duckdb_holtfs_glob_index');
+----
+2
+
+query II
+SELECT CAST(source_files AS INTEGER),
+       CAST(is_current AS INTEGER)
+FROM holtfs_validate('{TEMP_DIR}/holtfs_glob_lake/**/*.parquet',
+                     '/tmp/duckdb_holtfs_glob_index',
+                     mode := 'persistent');
+----
+2	1
+
+query I
+SELECT sum(id)::INTEGER
+FROM holt_parquet_scan('/tmp/duckdb_holtfs_glob_index',
+                       mode := 'persistent',
+                       prefix := '{TEMP_DIR}/holtfs_glob_lake/');
+----
+3
+
+query I
+SELECT indexed_files
+FROM holtfs_rebuild('{TEMP_DIR}/holtfs_glob_lake/**/*.parquet',
+                    '/tmp/duckdb_holtfs_glob_index',
+                    mode := 'persistent');
+----
+2
+
+statement error
+SELECT *
+FROM holtfs_refresh('{TEMP_DIR}/holtfs_glob_lake/**/*.parquet',
+                    '/tmp/duckdb_holtfs_glob_index',
+                    mode := 'persistent',
+                    prefix := '{TEMP_DIR}/holtfs_glob_lake/ds=2026-05-22/');
+----
+IO Error: holtfs_refresh prefix refresh is not supported for glob source_path; rebuild the index
 
 query IIII
 SELECT CAST(source_files AS INTEGER),

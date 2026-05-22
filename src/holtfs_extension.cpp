@@ -3,12 +3,17 @@
 #include "holtfs_extension.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/enums/file_glob_options.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "holt_ffi.h"
 
 #include <algorithm>
@@ -115,6 +120,55 @@ static string HoltfsLastError(const char *op) {
 		return string(op) + " failed";
 	}
 	return string(op) + " failed: " + msg;
+}
+
+struct OpenIndexTree {
+	OpenIndexTree() = default;
+
+	OpenIndexTree(OpenIndexTree &&other) noexcept
+	    : owned_tree(other.owned_tree), memory_tree(std::move(other.memory_tree)) {
+		other.owned_tree = nullptr;
+	}
+
+	OpenIndexTree &operator=(OpenIndexTree &&other) noexcept {
+		if (this != &other) {
+			if (owned_tree) {
+				holt_tree_close(owned_tree);
+			}
+			owned_tree = other.owned_tree;
+			memory_tree = std::move(other.memory_tree);
+			other.owned_tree = nullptr;
+		}
+		return *this;
+	}
+
+	~OpenIndexTree() {
+		if (owned_tree) {
+			holt_tree_close(owned_tree);
+		}
+	}
+
+	OpenIndexTree(const OpenIndexTree &) = delete;
+	OpenIndexTree &operator=(const OpenIndexTree &) = delete;
+
+	HoltTree *Tree() const {
+		return memory_tree ? memory_tree->tree : owned_tree;
+	}
+
+	HoltTree *owned_tree = nullptr;
+	HoltTreeRef memory_tree;
+};
+
+static OpenIndexTree OpenIndexForRead(const string &index_ref, IndexMode mode) {
+	OpenIndexTree index;
+	if (mode == IndexMode::PERSISTENT) {
+		if (holt_tree_open_with_wal_commit(index_ref.c_str(), HOLT_WAL_ENQUEUE, &index.owned_tree) != HOLT_OK) {
+			throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
+		}
+	} else {
+		index.memory_tree = MemoryIndexes().Get(index_ref);
+	}
+	return index;
 }
 
 static string InternalKeyPrefix() {
@@ -519,7 +573,7 @@ static void IndexOneFile(FileSystem &fs, HoltTree *tree, const string &path, uin
 }
 
 template <class FileCallback>
-static bool WalkSourceFiles(FileSystem &fs, const string &source, FileCallback callback) {
+static bool WalkLocalSourceFiles(FileSystem &fs, const string &source, FileCallback callback) {
 	if (fs.FileExists(source)) {
 		callback(source);
 		return true;
@@ -531,7 +585,7 @@ static bool WalkSourceFiles(FileSystem &fs, const string &source, FileCallback c
 	auto listed = fs.ListFiles(source, [&](const string &name, bool is_directory) {
 		auto child = fs.JoinPath(source, name);
 		if (is_directory) {
-			if (!WalkSourceFiles(fs, child, callback)) {
+			if (!WalkLocalSourceFiles(fs, child, callback)) {
 				throw IOException("source path disappeared while walking: " + child);
 			}
 		} else {
@@ -544,10 +598,52 @@ static bool WalkSourceFiles(FileSystem &fs, const string &source, FileCallback c
 	return true;
 }
 
+template <class FileCallback>
+static bool GlobSourceFiles(FileSystem &fs, const string &source, FileGlobOptions behavior, FileCallback callback) {
+	auto files = fs.GlobFileList(source, FileGlobInput(behavior))->GetAllFiles();
+	if (files.empty()) {
+		return false;
+	}
+	std::sort(files.begin(), files.end());
+	for (auto &file : files) {
+		callback(file.path);
+	}
+	return true;
+}
+
+static string JoinPathComponent(FileSystem &fs, const string &root, const string &component) {
+	if (root.empty()) {
+		return component;
+	}
+	if (root.back() == '/' || root.back() == '\\') {
+		return root + component;
+	}
+	return fs.JoinPath(root, component);
+}
+
+static string ParquetDatasetGlob(FileSystem &fs, const string &source) {
+	return JoinPathComponent(fs, JoinPathComponent(fs, source, "**"), "*.parquet");
+}
+
+template <class FileCallback>
+static bool ExpandSourceFiles(FileSystem &fs, const string &source, FileCallback callback) {
+	if (FileSystem::HasGlob(source)) {
+		return GlobSourceFiles(fs, source, FileGlobOptions::ALLOW_EMPTY, callback);
+	}
+	if (WalkLocalSourceFiles(fs, source, callback)) {
+		return true;
+	}
+	return GlobSourceFiles(fs, ParquetDatasetGlob(fs, source), FileGlobOptions::ALLOW_EMPTY, callback);
+}
+
 static void IndexPath(FileSystem &fs, HoltTree *tree, const string &source, uint64_t &files, uint64_t &bytes) {
-	auto exists = WalkSourceFiles(fs, source, [&](const string &path) { IndexOneFile(fs, tree, path, files, bytes); });
+	auto exists =
+	    ExpandSourceFiles(fs, source, [&](const string &path) { IndexOneFile(fs, tree, path, files, bytes); });
 	if (!exists) {
-		throw IOException("holtfs_index source path is neither a file nor a directory: " + source);
+		if (FileSystem::HasGlob(source)) {
+			throw IOException("holtfs_index source glob matched no files: " + source);
+		}
+		throw IOException("holtfs_index source path is neither a file nor a directory or parquet dataset: " + source);
 	}
 }
 
@@ -677,11 +773,12 @@ struct CollectedFiles {
 	vector<IndexedFile> files;
 	std::unordered_set<string> keys;
 	uint64_t bytes = 0;
+	bool source_exists = false;
 };
 
 static CollectedFiles CollectSourceFiles(FileSystem &fs, const string &source) {
 	CollectedFiles result;
-	WalkSourceFiles(fs, source, [&](const string &path) {
+	result.source_exists = ExpandSourceFiles(fs, source, [&](const string &path) {
 		auto file = ReadFileMetadata(fs, path);
 		result.bytes += file.size;
 		result.keys.insert(file.key);
@@ -691,10 +788,11 @@ static CollectedFiles CollectSourceFiles(FileSystem &fs, const string &source) {
 }
 
 template <class RecordCallback>
-static void ScanIndexRecords(HoltTree *tree, const string &prefix, RecordCallback callback) {
+static void ScanIndexRecordsFrom(HoltTree *tree, const string &prefix, const string &start_after,
+                                 RecordCallback callback) {
 	HoltIter *iter = nullptr;
-	auto rc = holt_tree_scan_records(tree, reinterpret_cast<const uint8_t *>(prefix.data()), prefix.size(), -1, nullptr,
-	                                 0, &iter);
+	auto rc = holt_tree_scan_records(tree, reinterpret_cast<const uint8_t *>(prefix.data()), prefix.size(), -1,
+	                                 OptionalData(start_after), OptionalSize(start_after), &iter);
 	if (rc != HOLT_OK) {
 		throw IOException(HoltfsLastError("holt_tree_scan_records"));
 	}
@@ -720,6 +818,11 @@ static void ScanIndexRecords(HoltTree *tree, const string &prefix, RecordCallbac
 		}
 	}
 	holt_iter_close(iter);
+}
+
+template <class RecordCallback>
+static void ScanIndexRecords(HoltTree *tree, const string &prefix, RecordCallback callback) {
+	ScanIndexRecordsFrom(tree, prefix, string(), callback);
 }
 
 static uint64_t MetadataSize(const string &value) {
@@ -761,6 +864,134 @@ static vector<string> CollectIndexedKeys(HoltTree *tree, const string &prefix) {
 		}
 	});
 	return keys;
+}
+
+struct OptionalNamedParameter {
+	bool set = false;
+	Value value;
+};
+
+struct HoltfsParquetScanBindData {
+	string index_ref;
+	IndexMode mode = IndexMode::PERSISTENT;
+	string prefix;
+	string start_after;
+	idx_t max_files = 0;
+	OptionalNamedParameter filename;
+	OptionalNamedParameter hive_partitioning;
+	OptionalNamedParameter union_by_name;
+};
+
+static bool EndsWith(const string &value, const string &suffix) {
+	return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static bool IsParquetDataFile(const string &path) {
+	return EndsWith(LowerAscii(path), ".parquet");
+}
+
+static void ReadParquetScanNamedParameters(TableFunctionBindInput &input, HoltfsParquetScanBindData &result) {
+	for (auto &kv : input.named_parameters) {
+		if (kv.second.IsNull()) {
+			throw BinderException("holt_parquet_scan named parameters cannot be NULL");
+		}
+		if (kv.first == "mode") {
+			result.mode = ParseMode(StringValue::Get(kv.second));
+		} else if (kv.first == "prefix") {
+			result.prefix = StringValue::Get(kv.second);
+		} else if (kv.first == "start_after") {
+			result.start_after = StringValue::Get(kv.second);
+		} else if (kv.first == "max_files") {
+			auto value = UBigIntValue::Get(kv.second);
+			if (value > std::numeric_limits<idx_t>::max()) {
+				throw BinderException("holt_parquet_scan max_files exceeds idx_t");
+			}
+			result.max_files = static_cast<idx_t>(value);
+		} else if (kv.first == "filename") {
+			result.filename.set = true;
+			result.filename.value = kv.second;
+		} else if (kv.first == "hive_partitioning") {
+			result.hive_partitioning.set = true;
+			result.hive_partitioning.value = kv.second;
+		} else if (kv.first == "union_by_name") {
+			result.union_by_name.set = true;
+			result.union_by_name.value = kv.second;
+		}
+	}
+}
+
+static vector<string> CollectParquetFiles(const HoltfsParquetScanBindData &bind) {
+	auto index = OpenIndexForRead(bind.index_ref, bind.mode);
+	vector<string> files;
+	ScanIndexRecordsFrom(index.Tree(), bind.prefix, bind.start_after, [&](const string &key, const string &) {
+		if (IsInternalKey(key) || !IsParquetDataFile(key)) {
+			return;
+		}
+		files.push_back(key);
+	});
+	if (bind.max_files && files.size() > bind.max_files) {
+		files.resize(bind.max_files);
+	}
+	return files;
+}
+
+static Value FileListValue(const vector<string> &files) {
+	vector<Value> values;
+	values.reserve(files.size());
+	for (auto &file : files) {
+		values.emplace_back(file);
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(values));
+}
+
+static void AddNamedParameter(vector<unique_ptr<ParsedExpression>> &children, const string &name, const Value &value) {
+	auto expression = make_uniq<ConstantExpression>(value);
+	expression->SetAlias(name);
+	children.push_back(std::move(expression));
+}
+
+static unique_ptr<TableRef> HoltParquetScanBindReplace(ClientContext &, TableFunctionBindInput &input) {
+	if (input.inputs.size() != 1) {
+		throw BinderException("holt_parquet_scan(index_ref, ...) expects exactly one VARCHAR argument");
+	}
+
+	HoltfsParquetScanBindData bind;
+	bind.index_ref = StringValue::Get(input.inputs[0]);
+	ReadParquetScanNamedParameters(input, bind);
+
+	auto files = CollectParquetFiles(bind);
+	if (files.empty()) {
+		throw IOException("holt_parquet_scan found no Parquet files for prefix: " + bind.prefix);
+	}
+
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(make_uniq<ConstantExpression>(FileListValue(files)));
+	if (bind.filename.set) {
+		AddNamedParameter(children, "filename", bind.filename.value);
+	}
+	if (bind.hive_partitioning.set) {
+		AddNamedParameter(children, "hive_partitioning", bind.hive_partitioning.value);
+	}
+	if (bind.union_by_name.set) {
+		AddNamedParameter(children, "union_by_name", bind.union_by_name.value);
+	}
+
+	auto table_function = make_uniq<TableFunctionRef>();
+	table_function->function = make_uniq<FunctionExpression>("read_parquet", std::move(children));
+	return std::move(table_function);
+}
+
+static void RegisterHoltParquetScan(ExtensionLoader &loader) {
+	TableFunction function("holt_parquet_scan", {LogicalType::VARCHAR}, nullptr, nullptr);
+	function.bind_replace = HoltParquetScanBindReplace;
+	function.named_parameters["mode"] = LogicalType::VARCHAR;
+	function.named_parameters["prefix"] = LogicalType::VARCHAR;
+	function.named_parameters["start_after"] = LogicalType::VARCHAR;
+	function.named_parameters["max_files"] = LogicalType::UBIGINT;
+	function.named_parameters["filename"] = LogicalType::ANY;
+	function.named_parameters["hive_partitioning"] = LogicalType::BOOLEAN;
+	function.named_parameters["union_by_name"] = LogicalType::BOOLEAN;
+	loader.RegisterFunction(function);
 }
 
 struct HoltfsStatusBindData : public TableFunctionData {
@@ -826,6 +1057,10 @@ static unique_ptr<GlobalTableFunctionState> HoltfsStatusInit(ClientContext &, Ta
 	return make_uniq<HoltfsStatusGlobalState>();
 }
 
+static bool SourceHasCheapExistenceCheck(const string &source_path) {
+	return !FileSystem::HasGlob(source_path) && !FileSystem::IsRemoteFile(source_path);
+}
+
 static void HoltfsStatusFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind = input.bind_data->CastNoConst<HoltfsStatusBindData>();
 	auto &state = input.global_state->Cast<HoltfsStatusGlobalState>();
@@ -835,22 +1070,13 @@ static void HoltfsStatusFunction(ClientContext &context, TableFunctionInput &inp
 	}
 	state.done = true;
 
-	HoltTree *owned_tree = nullptr;
-	HoltTreeRef memory_tree;
-	if (bind.mode == IndexMode::PERSISTENT) {
-		if (holt_tree_open_with_wal_commit(bind.index_ref.c_str(), HOLT_WAL_ENQUEUE, &owned_tree) != HOLT_OK) {
-			throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
-		}
-	} else {
-		memory_tree = MemoryIndexes().Get(bind.index_ref);
-	}
-
-	HoltTreeHandle owned_handle(owned_tree);
-	auto tree = memory_tree ? memory_tree->tree : owned_handle.tree;
+	auto index = OpenIndexForRead(bind.index_ref, bind.mode);
+	auto tree = index.Tree();
 	auto manifest = ReadManifest(tree);
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto source_exists =
-	    manifest.exists && (fs.FileExists(manifest.source_path) || fs.DirectoryExists(manifest.source_path));
+	    manifest.exists && (!SourceHasCheapExistenceCheck(manifest.source_path) ||
+	                        fs.FileExists(manifest.source_path) || fs.DirectoryExists(manifest.source_path));
 	auto now = NowMicros();
 	auto age_seconds = manifest.exists && manifest.refreshed_at_us <= now
 	                       ? static_cast<double>(now - manifest.refreshed_at_us) / 1000000.0
@@ -1013,6 +1239,9 @@ static void HoltfsRefreshFunction(ClientContext &context, TableFunctionInput &in
 	state.done = true;
 
 	auto &fs = FileSystem::GetFileSystem(context);
+	if (!bind.prefix.empty() && FileSystem::HasGlob(bind.source_path)) {
+		throw IOException("holtfs_refresh prefix refresh is not supported for glob source_path; rebuild the index");
+	}
 	auto refresh_path = ResolveSubtreePath(fs, bind.source_path, bind.prefix);
 	uint64_t refreshed_files = 0;
 	uint64_t refreshed_bytes = 0;
@@ -1069,6 +1298,11 @@ static void RegisterHoltfsRefresh(ExtensionLoader &loader) {
 	function.named_parameters["mode"] = LogicalType::VARCHAR;
 	function.named_parameters["prefix"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(function);
+
+	TableFunction rebuild_function("holtfs_rebuild", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                               HoltfsRefreshFunction, HoltfsRefreshBind, HoltfsRefreshInit);
+	rebuild_function.named_parameters["mode"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(rebuild_function);
 }
 
 struct HoltfsValidateBindData : public TableFunctionData {
@@ -1089,6 +1323,7 @@ struct ValidationStats {
 	uint64_t changed_files = 0;
 	uint64_t missing_files = 0;
 	uint64_t deleted_files = 0;
+	std::unordered_set<string> source_keys;
 };
 
 static void ReadValidateNamedParameters(TableFunctionBindInput &input, HoltfsValidateBindData &result) {
@@ -1157,6 +1392,7 @@ static void ValidateOneSourceFile(FileSystem &fs, HoltTree *tree, const string &
 	}
 
 	stats.source_files++;
+	stats.source_keys.insert(file.key);
 	if (!record.found) {
 		stats.missing_files++;
 		holt_record_free(&record);
@@ -1172,15 +1408,16 @@ static void ValidateOneSourceFile(FileSystem &fs, HoltTree *tree, const string &
 
 static void ValidateSourcePath(FileSystem &fs, HoltTree *tree, const string &source, ValidationStats &stats) {
 	stats.source_exists =
-	    WalkSourceFiles(fs, source, [&](const string &path) { ValidateOneSourceFile(fs, tree, path, stats); });
+	    ExpandSourceFiles(fs, source, [&](const string &path) { ValidateOneSourceFile(fs, tree, path, stats); });
 }
 
 static void CountIndexedFiles(FileSystem &fs, HoltTree *tree, const string &source, ValidationStats &stats) {
-	auto prefix = fs.ConvertSeparators(source);
+	auto glob_source = FileSystem::HasGlob(source);
+	auto prefix = glob_source ? string() : fs.ConvertSeparators(source);
 	ScanIndexRecords(tree, prefix, [&](const string &path, const string &) {
-		if (!IsInternalKey(path) && IsUnderSourcePath(path, prefix)) {
+		if (!IsInternalKey(path) && (glob_source || IsUnderSourcePath(path, prefix))) {
 			stats.indexed_files++;
-			if (!fs.FileExists(path)) {
+			if (stats.source_keys.find(path) == stats.source_keys.end()) {
 				stats.deleted_files++;
 			}
 		}
@@ -1196,18 +1433,8 @@ static void HoltfsValidateFunction(ClientContext &context, TableFunctionInput &i
 	}
 	state.done = true;
 
-	HoltTree *owned_tree = nullptr;
-	HoltTreeRef memory_tree;
-	if (bind.mode == IndexMode::PERSISTENT) {
-		if (holt_tree_open_with_wal_commit(bind.index_ref.c_str(), HOLT_WAL_ENQUEUE, &owned_tree) != HOLT_OK) {
-			throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
-		}
-	} else {
-		memory_tree = MemoryIndexes().Get(bind.index_ref);
-	}
-
-	HoltTreeHandle owned_handle(owned_tree);
-	auto tree = memory_tree ? memory_tree->tree : owned_handle.tree;
+	auto index = OpenIndexForRead(bind.index_ref, bind.mode);
+	auto tree = index.Tree();
 	auto &fs = FileSystem::GetFileSystem(context);
 	ValidationStats stats;
 	ValidateSourcePath(fs, tree, bind.source_path, stats);
@@ -1243,6 +1470,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterHoltfsStatus(loader);
 	RegisterHoltfsRefresh(loader);
 	RegisterHoltFiles(loader);
+	RegisterHoltParquetScan(loader);
 	RegisterHoltfsValidate(loader);
 }
 

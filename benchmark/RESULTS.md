@@ -4,40 +4,48 @@ This is a local reference run, not a publication-grade result. It
 measures warm-cache file discovery on the current macOS development
 machine and isolates namespace planning only.
 
+Environment:
+
+- date: May 22, 2026
+- machine: Apple M3 Pro, 12 CPU cores, 36 GiB memory
+- OS: macOS 26.3, Darwin 25.3.0, arm64
+- DuckDB: release build from this repository
+- HoltFS: v0.1.0
+
 Command:
 
 ```sh
 python3 benchmark/metadata_discovery.py \
   --duckdb ./build/release/duckdb \
   --extension ./build/release/extension/holtfs/holtfs.duckdb_extension \
-  --workdir /tmp/holtfs-metadata-bench-20k \
-  --files 20000 \
-  --partitions 240 \
-  --runs 5 \
+  --workdir /tmp/holtfs-metadata-bench-100k \
+  --files 100000 \
+  --partitions 1000 \
+  --runs 7 \
   --recreate
 ```
 
 Dataset:
 
-- 20,000 local `.parquet` placeholder files
-- 240 lakehouse-shaped partitions
+- 100,000 local `.parquet` placeholder files
+- 1,000 lakehouse-shaped partitions
 - shape: `source/bucket/table/date=.../hour=.../part-XXXXXXXX.parquet`
-- all timings are warm-cache iterations
+- all timings are warm-cache iterations after index build
 
 Index build:
 
 | Mode | Build Time |
 |---|---:|
-| Persistent Holt index | 572.57 ms |
-| Memory Holt index | 840.83 ms |
+| Persistent Holt index | 2895.41 ms |
+| Memory Holt index | 4449.09 ms |
 
 Discovery:
 
 | Path | Count | Median ms | Min ms | Max ms | vs Native |
 |---|---:|---:|---:|---:|---:|
-| DuckDB native glob | 20,000 | 165.53 | 163.73 | 171.70 | 1.00x |
-| Holt persistent scan | 20,000 | 9.47 | 9.21 | 12.98 | 17.48x |
-| Holt memory scan | 20,000 | 6.09 | 5.92 | 6.80 | 27.17x |
+| DuckDB native `glob()` | 100,000 | 806.68 | 796.67 | 913.21 | 1.00x |
+| Holt persistent scan | 100,000 | 48.79 | 48.09 | 50.98 | 16.53x |
+| Holt memory scan | 100,000 | 32.91 | 32.32 | 33.45 | 24.51x |
 
 Interpretation:
 
@@ -56,37 +64,37 @@ Command:
 python3 benchmark/index_maintenance.py \
   --duckdb ./build/release/duckdb \
   --extension ./build/release/extension/holtfs/holtfs.duckdb_extension \
-  --workdir /tmp/holtfs-maintenance-bench-20k \
-  --files 20000 \
-  --partitions 240 \
+  --workdir /tmp/holtfs-maintenance-bench-100k \
+  --files 100000 \
+  --partitions 1000 \
   --delta-files 100 \
-  --runs 5 \
+  --runs 7 \
   --recreate
 ```
 
 Dataset:
 
-- 20,000 initial local placeholder files
-- 20,500 final indexed files after five delta-prefix refreshes
-- 240 lakehouse-shaped partitions
+- 100,000 initial local placeholder files
+- 100,700 final indexed files after seven delta-prefix refreshes
+- 1,000 lakehouse-shaped partitions
 - all timings are local warm-cache iterations
 
 Index build:
 
 | Mode | Build Time |
 |---|---:|
-| Initial persistent Holt index | 603.70 ms |
-| Final full validate after deltas | 633.94 ms |
+| Initial persistent Holt index | 2860.94 ms |
+| Final full validate after deltas | 2709.52 ms |
 
 Maintenance:
 
 | Path | Result | Median ms | Min ms | Max ms | vs Full Refresh |
 |---|---:|---:|---:|---:|---:|
-| `holtfs_status` manifest read | stale=0 | 0.69 | 0.64 | 0.91 | 874.36x |
-| Prefix refresh, unchanged partition | 83 | 19.14 | 18.04 | 21.09 | 31.31x |
-| Full validate scan | current=1 | 525.47 | 524.22 | 615.08 | 1.14x |
-| Full refresh/rebuild | 20,000 | 599.45 | 521.68 | 606.93 | 1.00x |
-| Prefix refresh, new partition | 100 | 19.10 | 18.01 | 21.71 | 31.39x |
+| `holtfs_status` manifest read | stale=0 | 0.66 | 0.63 | 0.94 | 4319.07x |
+| Prefix refresh, unchanged partition | 100 | 52.94 | 51.13 | 54.26 | 54.25x |
+| Full validate scan | current=1 | 2654.06 | 2646.86 | 2676.11 | 1.08x |
+| Full refresh/rebuild | 100,000 | 2871.83 | 2852.22 | 2896.86 | 1.00x |
+| Prefix refresh, new partition | 100 | 53.33 | 49.72 | 55.78 | 53.85x |
 
 Interpretation:
 
