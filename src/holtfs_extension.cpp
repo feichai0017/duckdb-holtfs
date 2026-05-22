@@ -4,6 +4,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -36,6 +37,24 @@ struct HoltfsFilesBindData : public TableFunctionData {
 	idx_t max_files = 0;
 	bool include_value = false;
 };
+
+struct HoltTreeHandle {
+	~HoltTreeHandle() {
+		if (tree) {
+			holt_tree_close(tree);
+		}
+	}
+
+	HoltTree *tree = nullptr;
+};
+
+static string HoltfsLastError(const char *op) {
+	auto msg = holt_last_error_message();
+	if (!msg || !msg[0]) {
+		return string(op) + " failed";
+	}
+	return string(op) + " failed: " + msg;
+}
 
 static void ReadFilesNamedParameters(TableFunctionBindInput &input, HoltfsFilesBindData &result) {
 	for (auto &kv : input.named_parameters) {
@@ -99,14 +118,6 @@ struct HoltfsFilesGlobalState : public GlobalTableFunctionState {
 	HoltIter *iter = nullptr;
 	idx_t emitted = 0;
 };
-
-static string HoltfsLastError(const char *op) {
-	auto msg = holt_last_error_message();
-	if (!msg || !msg[0]) {
-		return string(op) + " failed";
-	}
-	return string(op) + " failed: " + msg;
-}
 
 static const uint8_t *OptionalData(const string &value) {
 	if (value.empty()) {
@@ -213,9 +224,127 @@ static void RegisterHoltFiles(ExtensionLoader &loader) {
 	loader.RegisterFunction(function);
 }
 
+struct HoltfsIndexBindData : public TableFunctionData {
+	string source_path;
+	string index_path;
+};
+
+struct HoltfsIndexGlobalState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+static unique_ptr<FunctionData> HoltfsIndexBind(ClientContext &, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs.size() != 2) {
+		throw BinderException("holtfs_index(source_path, index_path) expects two VARCHAR arguments");
+	}
+
+	auto result = make_uniq<HoltfsIndexBindData>();
+	result->source_path = StringValue::Get(input.inputs[0]);
+	result->index_path = StringValue::Get(input.inputs[1]);
+
+	names.emplace_back("source_path");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("index_path");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("indexed_files");
+	return_types.emplace_back(LogicalType::UBIGINT);
+	names.emplace_back("indexed_bytes");
+	return_types.emplace_back(LogicalType::UBIGINT);
+
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> HoltfsIndexInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<HoltfsIndexGlobalState>();
+}
+
+static string MetadataValue(uint64_t size) {
+	return "size=" + std::to_string(size) + ";kind=file";
+}
+
+static void IndexOneFile(FileSystem &fs, HoltTree *tree, const string &path, uint64_t &files, uint64_t &bytes) {
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	auto file_size = handle->GetFileSize();
+	if (file_size < 0) {
+		throw IOException("failed to stat file '" + path + "'");
+	}
+
+	auto key = fs.ConvertSeparators(path);
+	auto size = static_cast<uint64_t>(file_size);
+	auto value = MetadataValue(size);
+	auto rc = holt_tree_put(tree, reinterpret_cast<const uint8_t *>(key.data()), key.size(),
+	                        reinterpret_cast<const uint8_t *>(value.data()), value.size());
+	if (rc != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_put"));
+	}
+
+	files++;
+	bytes += size;
+}
+
+static void IndexPath(FileSystem &fs, HoltTree *tree, const string &source, uint64_t &files, uint64_t &bytes) {
+	if (fs.FileExists(source)) {
+		IndexOneFile(fs, tree, source, files, bytes);
+		return;
+	}
+	if (!fs.DirectoryExists(source)) {
+		throw IOException("holtfs_index source path is neither a file nor a directory: " + source);
+	}
+
+	auto listed = fs.ListFiles(source, [&](const string &name, bool is_directory) {
+		auto child = fs.JoinPath(source, name);
+		if (is_directory) {
+			IndexPath(fs, tree, child, files, bytes);
+		} else {
+			IndexOneFile(fs, tree, child, files, bytes);
+		}
+	});
+	if (!listed) {
+		throw IOException("failed to list source directory '" + source + "'");
+	}
+}
+
+static void HoltfsIndexFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &bind = input.bind_data->CastNoConst<HoltfsIndexBindData>();
+	auto &state = input.global_state->Cast<HoltfsIndexGlobalState>();
+	if (state.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.done = true;
+
+	HoltTreeHandle handle;
+	if (holt_tree_open_with_wal_commit(bind.index_path.c_str(), HOLT_WAL_WRITE, &handle.tree) != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
+	}
+
+	uint64_t files = 0;
+	uint64_t bytes = 0;
+	auto &fs = FileSystem::GetFileSystem(context);
+	IndexPath(fs, handle.tree, bind.source_path, files, bytes);
+
+	if (holt_tree_checkpoint(handle.tree) != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_checkpoint"));
+	}
+
+	output.data[0].SetValue(0, Value(bind.source_path));
+	output.data[1].SetValue(0, Value(bind.index_path));
+	output.data[2].SetValue(0, Value::UBIGINT(files));
+	output.data[3].SetValue(0, Value::UBIGINT(bytes));
+	output.SetCardinality(1);
+}
+
+static void RegisterHoltfsIndex(ExtensionLoader &loader) {
+	TableFunction function("holtfs_index", {LogicalType::VARCHAR, LogicalType::VARCHAR}, HoltfsIndexFunction,
+	                       HoltfsIndexBind, HoltfsIndexInit);
+	loader.RegisterFunction(function);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction version_function("holtfs_version", {}, LogicalType::VARCHAR, HoltfsVersionFunction);
 	loader.RegisterFunction(version_function);
+	RegisterHoltfsIndex(loader);
 	RegisterHoltFiles(loader);
 }
 

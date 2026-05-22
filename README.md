@@ -5,10 +5,14 @@ metadata indexes stored in [Holt](https://github.com/feichai0017/holt).
 It is based on DuckDB's official
 [`extension-template`](https://github.com/duckdb/extension-template).
 
-The current extension exposes Holt-backed namespace listing:
+The current extension exposes local file indexing plus Holt-backed
+namespace listing:
 
 ```sql
 LOAD holtfs;
+
+SELECT *
+FROM holtfs_index('/lake/table', '/var/cache/duckdb/table.holt');
 
 SELECT *
 FROM holt_files(
@@ -61,7 +65,18 @@ make GEN=ninja EXT_FLAGS="-DHOLT_ROOT=/path/to/holt"
   -c "LOAD './build/release/extension/holtfs/holtfs.duckdb_extension'; SELECT holtfs_version();"
 ```
 
-For a Holt index that already exists:
+Build or refresh a local metadata index:
+
+```sql
+SELECT *
+FROM holtfs_index('/data/lake/table',
+                  '/var/cache/duckdb/table.holt');
+```
+
+The index stores regular files as `path -> metadata` records where the
+metadata payload currently contains `size=<bytes>;kind=file`.
+
+Read a Holt index:
 
 ```sql
 SELECT entry_type, path, version
@@ -83,8 +98,9 @@ FROM holt_files('/var/cache/duckdb/table.holt',
 
 This repository is intentionally narrow:
 
-- `holtfs_version()` is a smoke-test scalar function.
-- `holt_files(...)` reads an existing Holt metadata index through
+- `holtfs_index(source_path, index_path)` indexes regular files from a
+  local path into Holt.
+- `holt_files(...)` lists an existing Holt metadata index through
   Holt's C ABI.
-- Index construction and direct Parquet delegation are the next steps;
-  they are not exposed as placeholder SQL functions yet.
+- Direct Parquet delegation is the next step; it is not exposed as a
+  placeholder SQL function.

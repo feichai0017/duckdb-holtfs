@@ -1,6 +1,6 @@
 # name: test/sql/holtfs.test
 # description: holtfs extension smoke test
-# group: [holtfs]
+# group: [sql]
 
 require holtfs
 
@@ -13,3 +13,28 @@ statement error
 SELECT * FROM holt_files('/tmp/holtfs-index', delimiter := '//');
 ----
 Binder Error: holtfs delimiter must be empty or a single byte
+
+query I
+SELECT indexed_files
+FROM holtfs_index('test/fixtures/holtfs', '/tmp/duckdb_holtfs_sql_index');
+----
+3
+
+query TTI
+SELECT entry_type, path, CAST(version > 0 AS INTEGER)
+FROM holt_files('/tmp/duckdb_holtfs_sql_index',
+                prefix := 'test/fixtures/holtfs/bucket/table/',
+                delimiter := '/')
+ORDER BY path;
+----
+key	test/fixtures/holtfs/bucket/table/_metadata	1
+common_prefix	test/fixtures/holtfs/bucket/table/date=2026-05-22/	0
+common_prefix	test/fixtures/holtfs/bucket/table/date=2026-05-23/	0
+
+query TI
+SELECT path, CAST(CAST(value AS VARCHAR) = 'size=5;kind=file' AS INTEGER)
+FROM holt_files('/tmp/duckdb_holtfs_sql_index',
+                prefix := 'test/fixtures/holtfs/bucket/table/date=2026-05-22/part-000.parquet',
+                include_value := true);
+----
+test/fixtures/holtfs/bucket/table/date=2026-05-22/part-000.parquet	1
