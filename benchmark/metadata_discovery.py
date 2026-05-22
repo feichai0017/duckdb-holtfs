@@ -181,13 +181,13 @@ def main() -> int:
     with DuckDBSession(args.duckdb, args.extension) as session:
         build_persistent, rows = session.query(
             "SELECT indexed_files FROM holtfs_index("
-            f"{source_sql}, mode := 'persistent', index_path := {index_sql}, refresh := 'replace')"
+            f"{source_sql}, mode := 'persistent', index_path := {index_sql})"
         )
         persistent_files = count_from_rows(rows)
 
         build_memory, rows = session.query(
             "SELECT indexed_files FROM holtfs_index("
-            f"{source_sql}, mode := 'memory', name := {memory_sql}, refresh := 'replace')"
+            f"{source_sql}, mode := 'memory', name := {memory_sql})"
         )
         memory_files = count_from_rows(rows)
 

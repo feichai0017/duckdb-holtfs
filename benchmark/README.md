@@ -29,6 +29,19 @@ python3 benchmark/metadata_discovery.py \
   --recreate
 ```
 
+To measure index maintenance costs:
+
+```sh
+python3 benchmark/index_maintenance.py \
+  --duckdb ./build/release/duckdb \
+  --extension ./build/release/extension/holtfs/holtfs.duckdb_extension \
+  --files 100000 \
+  --partitions 1000 \
+  --delta-files 100 \
+  --runs 7 \
+  --recreate
+```
+
 The script creates a local lakehouse-shaped tree:
 
 ```text
@@ -39,6 +52,15 @@ It reports persistent index build time, memory index build time, and
 warm-cache discovery latency for native glob vs Holt scans.
 
 See [`RESULTS.md`](RESULTS.md) for a local reference run.
+
+`metadata_discovery.py` measures repeated file discovery after an index
+exists. `index_maintenance.py` measures the operational paths around that
+index: cheap status checks, known-prefix refresh, full validate, and full
+refresh/rebuild.
+
+`holtfs_status` is a cheap manifest/TTL check. It does not walk the source
+namespace. Use `holtfs_validate` when the benchmark or application needs an
+exact stale-index audit.
 
 `holtfs_validate` is intentionally not part of the latency comparison.
 Validation walks the source namespace and is the correctness check for a

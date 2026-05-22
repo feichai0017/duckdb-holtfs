@@ -27,9 +27,17 @@ Binder Error: holtfs mode must be 'persistent' or 'memory'
 statement error
 SELECT *
 FROM holtfs_index('test/fixtures/holtfs',
-                  mode := 'persistent',
-                  index_path := 'test/fixtures/holtfs/.holt',
+                  mode := 'memory',
+                  name := 'bad_refresh_arg',
                   refresh := 'replace');
+----
+Binder Error: Invalid named parameter "refresh" for function holtfs_index
+
+statement error
+SELECT *
+FROM holtfs_index('test/fixtures/holtfs',
+                  mode := 'persistent',
+                  index_path := 'test/fixtures/holtfs/.holt');
 ----
 IO Error: holtfs index_path must not be inside source_path
 
@@ -37,10 +45,58 @@ query I
 SELECT indexed_files
 FROM holtfs_index('test/fixtures/holtfs',
                   mode := 'persistent',
-                  index_path := '/tmp/duckdb_holtfs_sql_index',
-                  refresh := 'replace');
+                  index_path := '/tmp/duckdb_holtfs_sql_index');
 ----
 3
+
+query IIII
+SELECT CAST(has_manifest AS INTEGER),
+       CAST(source_exists AS INTEGER),
+       CAST(indexed_files AS INTEGER),
+       CAST(is_stale AS INTEGER)
+FROM holtfs_status('/tmp/duckdb_holtfs_sql_index',
+                   mode := 'persistent',
+                   max_age_seconds := 3600);
+----
+1	1	3	0
+
+query III
+SELECT CAST(has_manifest AS INTEGER),
+       CAST(source_exists AS INTEGER),
+       CAST(is_stale AS INTEGER)
+FROM holtfs_status('/tmp/duckdb_holtfs_empty_status',
+                   mode := 'persistent',
+                   max_age_seconds := 3600);
+----
+0	0	1
+
+query I
+SELECT count(*)
+FROM holt_files('/tmp/duckdb_holtfs_sql_index',
+                mode := 'persistent')
+WHERE entry_type = 'key';
+----
+3
+
+query I
+SELECT count(*)
+FROM holt_files('/tmp/duckdb_holtfs_sql_index',
+                mode := 'persistent',
+                prefix := 'test/fixtures/holtfs/bucket/table/date=2026-05-22/part-000.parquet')
+WHERE value IS NULL AND version > 0;
+----
+1
+
+query T
+SELECT path
+FROM holt_files('/tmp/duckdb_holtfs_sql_index',
+                mode := 'persistent',
+                prefix := 'test/fixtures/holtfs/bucket/table/',
+                start_after := 'test/fixtures/holtfs/bucket/table/date=2026-05-22/part-000.parquet',
+                max_files := 1)
+WHERE entry_type = 'key';
+----
+test/fixtures/holtfs/bucket/table/date=2026-05-23/part-000.parquet
 
 query TTI
 SELECT entry_type, path, CAST(version > 0 AS INTEGER)
@@ -63,6 +119,26 @@ FROM holt_files('/tmp/duckdb_holtfs_sql_index',
 ----
 test/fixtures/holtfs/bucket/table/date=2026-05-22/part-000.parquet	1
 
+query III
+SELECT CAST(refreshed_files AS INTEGER),
+       CAST(removed_keys AS INTEGER),
+       CAST(indexed_files AS INTEGER)
+FROM holtfs_refresh('test/fixtures/holtfs',
+                    '/tmp/duckdb_holtfs_sql_index',
+                    mode := 'persistent',
+                    prefix := 'bucket/table/date=2026-05-22');
+----
+1	0	3
+
+statement error
+SELECT *
+FROM holtfs_refresh('test/fixtures/holtfs/bucket/table',
+                    '/tmp/duckdb_holtfs_sql_index',
+                    mode := 'persistent',
+                    prefix := 'date=2026-05-22');
+----
+IO Error: holtfs source_path does not match the index manifest
+
 query IIIIIII
 SELECT CAST(source_exists AS INTEGER),
        CAST(source_files AS INTEGER),
@@ -81,8 +157,7 @@ query I
 SELECT indexed_files
 FROM holtfs_index('test/fixtures/holtfs/bucket/table/date=2026-05-22',
                   mode := 'persistent',
-                  index_path := '/tmp/duckdb_holtfs_sql_index',
-                  refresh := 'replace');
+                  index_path := '/tmp/duckdb_holtfs_sql_index');
 ----
 1
 
@@ -110,10 +185,29 @@ query I
 SELECT indexed_files
 FROM holtfs_index('test/fixtures/holtfs',
                   mode := 'memory',
-                  name := 'fixture_memory',
-                  refresh := 'replace');
+                  name := 'fixture_memory');
 ----
 3
+
+query III
+SELECT CAST(has_manifest AS INTEGER),
+       CAST(indexed_files AS INTEGER),
+       CAST(is_stale AS INTEGER)
+FROM holtfs_status('fixture_memory',
+                   mode := 'memory',
+                   max_age_seconds := 3600);
+----
+1	3	0
+
+query III
+SELECT CAST(refreshed_files AS INTEGER),
+       CAST(removed_keys AS INTEGER),
+       CAST(indexed_files AS INTEGER)
+FROM holtfs_refresh('test/fixtures/holtfs',
+                    'fixture_memory',
+                    mode := 'memory');
+----
+3	0	3
 
 query I
 SELECT count(*)
@@ -133,3 +227,68 @@ FROM holtfs_validate('test/fixtures/holtfs',
                      mode := 'memory');
 ----
 3	3	3	1
+
+query III
+SELECT CAST(refreshed_files AS INTEGER),
+       CAST(removed_keys AS INTEGER),
+       CAST(indexed_files AS INTEGER)
+FROM holtfs_refresh('test/fixtures/holtfs',
+                    'fixture_memory',
+                    mode := 'memory',
+                    prefix := 'bucket/table/date=2026-05-23');
+----
+1	0	3
+
+statement ok
+COPY (SELECT 'before') TO '/tmp/duckdb_holtfs_mutable_source.csv' (FORMAT CSV, HEADER false);
+
+query I
+SELECT indexed_files
+FROM holtfs_index('/tmp/duckdb_holtfs_mutable_source.csv',
+                  mode := 'persistent',
+                  index_path := '/tmp/duckdb_holtfs_mutable_index');
+----
+1
+
+query III
+SELECT CAST(changed_files AS INTEGER),
+       CAST(missing_files AS INTEGER),
+       CAST(is_current AS INTEGER)
+FROM holtfs_validate('/tmp/duckdb_holtfs_mutable_source.csv',
+                     '/tmp/duckdb_holtfs_mutable_index',
+                     mode := 'persistent');
+----
+0	0	1
+
+statement ok
+COPY (SELECT 'after-with-a-longer-payload') TO '/tmp/duckdb_holtfs_mutable_source.csv' (FORMAT CSV, HEADER false);
+
+query III
+SELECT CAST(changed_files AS INTEGER),
+       CAST(missing_files AS INTEGER),
+       CAST(is_current AS INTEGER)
+FROM holtfs_validate('/tmp/duckdb_holtfs_mutable_source.csv',
+                     '/tmp/duckdb_holtfs_mutable_index',
+                     mode := 'persistent');
+----
+1	0	0
+
+query III
+SELECT CAST(refreshed_files AS INTEGER),
+       CAST(removed_keys AS INTEGER),
+       CAST(indexed_files AS INTEGER)
+FROM holtfs_refresh('/tmp/duckdb_holtfs_mutable_source.csv',
+                    '/tmp/duckdb_holtfs_mutable_index',
+                    mode := 'persistent',
+                    prefix := '/tmp/duckdb_holtfs_mutable_source.csv');
+----
+1	0	1
+
+query II
+SELECT CAST(changed_files AS INTEGER),
+       CAST(is_current AS INTEGER)
+FROM holtfs_validate('/tmp/duckdb_holtfs_mutable_source.csv',
+                     '/tmp/duckdb_holtfs_mutable_index',
+                     mode := 'persistent');
+----
+0	1

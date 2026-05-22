@@ -47,3 +47,52 @@ Interpretation:
 - S3/object-store claims need a separate run that includes
   `ListObjectsV2` pagination, network latency, and stale-index
   validation policy.
+
+## Index Maintenance Reference
+
+Command:
+
+```sh
+python3 benchmark/index_maintenance.py \
+  --duckdb ./build/release/duckdb \
+  --extension ./build/release/extension/holtfs/holtfs.duckdb_extension \
+  --workdir /tmp/holtfs-maintenance-bench-20k \
+  --files 20000 \
+  --partitions 240 \
+  --delta-files 100 \
+  --runs 5 \
+  --recreate
+```
+
+Dataset:
+
+- 20,000 initial local placeholder files
+- 20,500 final indexed files after five delta-prefix refreshes
+- 240 lakehouse-shaped partitions
+- all timings are local warm-cache iterations
+
+Index build:
+
+| Mode | Build Time |
+|---|---:|
+| Initial persistent Holt index | 603.70 ms |
+| Final full validate after deltas | 633.94 ms |
+
+Maintenance:
+
+| Path | Result | Median ms | Min ms | Max ms | vs Full Refresh |
+|---|---:|---:|---:|---:|---:|
+| `holtfs_status` manifest read | stale=0 | 0.69 | 0.64 | 0.91 | 874.36x |
+| Prefix refresh, unchanged partition | 83 | 19.14 | 18.04 | 21.09 | 31.31x |
+| Full validate scan | current=1 | 525.47 | 524.22 | 615.08 | 1.14x |
+| Full refresh/rebuild | 20,000 | 599.45 | 521.68 | 606.93 | 1.00x |
+| Prefix refresh, new partition | 100 | 19.10 | 18.01 | 21.71 | 31.39x |
+
+Interpretation:
+
+- `holtfs_status` is the cheap fast path for "can I use this snapshot?"
+  when the application relies on a TTL policy.
+- Prefix refresh is the intended maintenance path when an application
+  already knows which partition changed.
+- Full validate remains an exact audit path and is expected to cost about
+  the same order as walking the source namespace.
