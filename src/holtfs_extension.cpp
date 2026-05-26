@@ -122,6 +122,12 @@ static string HoltfsLastError(const char *op) {
 	return string(op) + " failed: " + msg;
 }
 
+static void OpenPersistentTree(const string &path, bool wal_sync, HoltTree **out) {
+	if (holt_tree_open_with_wal_sync(path.c_str(), wal_sync ? 1 : 0, out) != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_open_with_wal_sync"));
+	}
+}
+
 struct OpenIndexTree {
 	OpenIndexTree() = default;
 
@@ -162,9 +168,7 @@ struct OpenIndexTree {
 static OpenIndexTree OpenIndexForRead(const string &index_ref, IndexMode mode) {
 	OpenIndexTree index;
 	if (mode == IndexMode::PERSISTENT) {
-		if (holt_tree_open_with_wal_commit(index_ref.c_str(), HOLT_WAL_ENQUEUE, &index.owned_tree) != HOLT_OK) {
-			throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
-		}
+		OpenPersistentTree(index_ref, false, &index.owned_tree);
 	} else {
 		index.memory_tree = MemoryIndexes().Get(index_ref);
 	}
@@ -375,9 +379,7 @@ static unique_ptr<GlobalTableFunctionState> HoltfsFilesInit(ClientContext &, Tab
 	auto state = make_uniq<HoltfsFilesGlobalState>();
 
 	if (bind.mode == IndexMode::PERSISTENT) {
-		if (holt_tree_open_with_wal_commit(bind.index_ref.c_str(), HOLT_WAL_ENQUEUE, &state->owned_tree) != HOLT_OK) {
-			throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
-		}
+		OpenPersistentTree(bind.index_ref, false, &state->owned_tree);
 	} else {
 		state->memory_tree = MemoryIndexes().Get(bind.index_ref);
 	}
@@ -688,9 +690,7 @@ static void BuildPersistentIndex(FileSystem &fs, const HoltfsIndexBindData &bind
 	RemovePathIfExists(fs, temp_path);
 
 	HoltTree *tree = nullptr;
-	if (holt_tree_open_with_wal_commit(temp_path.c_str(), HOLT_WAL_WRITE, &tree) != HOLT_OK) {
-		throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
-	}
+	OpenPersistentTree(temp_path, false, &tree);
 	try {
 		HoltTreeHandle handle(tree);
 		IndexPath(fs, handle.tree, bind.source_path, files, bytes);
@@ -1265,9 +1265,7 @@ static void HoltfsRefreshFunction(ClientContext &context, TableFunctionInput &in
 	} else if (bind.mode == IndexMode::PERSISTENT) {
 		ValidateIndexLocation(bind.source_path, bind.index_ref);
 		HoltTree *tree = nullptr;
-		if (holt_tree_open_with_wal_commit(bind.index_ref.c_str(), HOLT_WAL_WRITE, &tree) != HOLT_OK) {
-			throw IOException(HoltfsLastError("holt_tree_open_with_wal_commit"));
-		}
+		OpenPersistentTree(bind.index_ref, false, &tree);
 		HoltTreeHandle handle(tree);
 		RefreshPrefix(fs, handle.tree, bind, refresh_path, refreshed_files, refreshed_bytes, removed_keys,
 		              indexed_files, indexed_bytes);
