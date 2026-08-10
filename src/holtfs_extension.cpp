@@ -178,9 +178,15 @@ static string ExceptionMessage(const std::exception_ptr &error) {
 	}
 }
 
-static void OpenPersistentTree(const string &path, bool wal_sync, HoltTree **out) {
+static void OpenPersistentTreeForWrite(const string &path, bool wal_sync, HoltTree **out) {
 	if (holt_tree_open_with_wal_sync(path.c_str(), wal_sync ? 1 : 0, out) != HOLT_OK) {
 		throw IOException(HoltfsLastError("holt_tree_open_with_wal_sync"));
+	}
+}
+
+static void OpenPersistentTreeReadOnly(const string &path, HoltTree **out) {
+	if (holt_tree_open_read_only(path.c_str(), out) != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_open_read_only"));
 	}
 }
 
@@ -200,7 +206,14 @@ static void RequirePersistentIndex(FileSystem &fs, const string &path) {
 static HoltTreeRef OpenPersistentTreeExisting(FileSystem &fs, const string &path) {
 	RequirePersistentIndex(fs, path);
 	HoltTree *tree = nullptr;
-	OpenPersistentTree(path, false, &tree);
+	OpenPersistentTreeReadOnly(path, &tree);
+	return std::make_shared<HoltTreeHandle>(tree);
+}
+
+static HoltTreeRef OpenPersistentTreeExistingForWrite(FileSystem &fs, const string &path) {
+	RequirePersistentIndex(fs, path);
+	HoltTree *tree = nullptr;
+	OpenPersistentTreeForWrite(path, false, &tree);
 	return std::make_shared<HoltTreeHandle>(tree);
 }
 
@@ -836,7 +849,7 @@ static void BuildPersistentIndex(FileSystem &fs, const HoltfsIndexBindData &bind
 
 	try {
 		HoltTree *tree = nullptr;
-		OpenPersistentTree(temp_path, false, &tree);
+		OpenPersistentTreeForWrite(temp_path, false, &tree);
 		HoltTreeHandle handle(tree);
 		IndexPath(fs, handle.tree, bind.source_path, files, bytes);
 		auto now = NowMicros();
@@ -1613,8 +1626,41 @@ static void HoltfsRefreshFunction(ClientContext &context, TableFunctionInput &in
 		}
 		auto manifest = ReadManifest(handle->tree);
 		CheckRefreshManifest(manifest, bind.source_path);
-		RefreshPrefix(handle->tree, bind, key_prefix, current, manifest, refreshed_files, refreshed_bytes, removed_keys,
-		              indexed_files, indexed_bytes);
+		if (bind.mode == IndexMode::MEMORY) {
+			RefreshPrefix(handle->tree, bind, key_prefix, current, manifest, refreshed_files, refreshed_bytes,
+			              removed_keys, indexed_files, indexed_bytes);
+		} else {
+			slot->tree.reset();
+			handle.reset();
+			HoltTreeRef writer;
+			bool refresh_committed = false;
+			try {
+				writer = OpenPersistentTreeExistingForWrite(fs, bind.index_ref);
+				RefreshPrefix(writer->tree, bind, key_prefix, current, manifest, refreshed_files, refreshed_bytes,
+				              removed_keys, indexed_files, indexed_bytes);
+				refresh_committed = true;
+				writer.reset();
+				slot->tree = OpenPersistentTreeExisting(fs, bind.index_ref);
+			} catch (...) {
+				auto operation_error = std::current_exception();
+				writer.reset();
+				try {
+					slot->tree = OpenPersistentTreeExisting(fs, bind.index_ref);
+				} catch (...) {
+					auto reopen_error = std::current_exception();
+					if (refresh_committed) {
+						throw IOException("holtfs_refresh committed but the read-only handle could not be restored: " +
+						                  ExceptionMessage(reopen_error));
+					}
+					throw IOException("holtfs_refresh failed and the read-only handle could not be restored; refresh error: " +
+					                  ExceptionMessage(operation_error) +
+					                  "; reopen error: " + ExceptionMessage(reopen_error));
+				}
+				if (!refresh_committed) {
+					std::rethrow_exception(operation_error);
+				}
+			}
+		}
 	}
 
 	output.data[0].SetValue(0, Value(bind.source_path));

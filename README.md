@@ -333,12 +333,19 @@ tokens.
 
 ### Process boundaries
 
-The pinned Holt C ABI does not expose a read-only open. Persistent read calls
-are non-creating, but the shared Holt handle still opens its files for write.
+Persistent reads use Holt's read-only ABI. The open requires an existing
+index, replays durable WAL records into memory, and does not create, repair,
+checkpoint, or compact store files.
 
-Do not use the same persistent index from multiple DuckDB processes when
-one of them can write. Use a full rebuild when you need the stronger publish
-boundary.
+Holt holds a shared lock on `blobs.dat` for each read-only handle and an
+exclusive lock for each read-write handle. Multiple DuckDB processes can read
+the same index, while a prefix refresh fails if another process has it open.
+HoltFS closes its cached reader before writing and restores a read-only handle
+after the checkpoint.
+
+A full rebuild publishes a new directory generation and lets existing readers
+finish against the previous generation. Concurrent full rebuilds of the same
+`index_path` still require external serialization.
 
 ## Scope
 
