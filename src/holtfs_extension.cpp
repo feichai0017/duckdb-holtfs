@@ -1652,9 +1652,9 @@ static void HoltfsRefreshFunction(ClientContext &context, TableFunctionInput &in
 						throw IOException("holtfs_refresh committed but the read-only handle could not be restored: " +
 						                  ExceptionMessage(reopen_error));
 					}
-					throw IOException("holtfs_refresh failed and the read-only handle could not be restored; refresh error: " +
-					                  ExceptionMessage(operation_error) +
-					                  "; reopen error: " + ExceptionMessage(reopen_error));
+					throw IOException(
+					    "holtfs_refresh failed and the read-only handle could not be restored; refresh error: " +
+					    ExceptionMessage(operation_error) + "; reopen error: " + ExceptionMessage(reopen_error));
 				}
 				if (!refresh_committed) {
 					std::rethrow_exception(operation_error);
