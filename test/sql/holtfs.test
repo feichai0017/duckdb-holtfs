@@ -7,7 +7,7 @@ require holtfs
 require parquet
 
 query I
-SELECT length(holtfs_version()) > 0;
+SELECT holtfs_version() = 'v0.2.0';
 ----
 true
 
@@ -20,6 +20,11 @@ statement error
 SELECT * FROM holt_files('missing_memory_index', mode := 'memory');
 ----
 IO Error: holtfs memory index not found: missing_memory_index
+
+statement error
+SELECT * FROM holtfs_status('s3://bucket/index.holt', mode := 'persistent');
+----
+IO Error: holtfs persistent index_ref must be a local path without glob characters
 
 statement error
 SELECT * FROM holtfs_validate('test/fixtures/holtfs', '/tmp/duckdb_holtfs_sql_index', mode := 'bad');
@@ -41,7 +46,39 @@ FROM holtfs_index('test/fixtures/holtfs',
                   mode := 'persistent',
                   index_path := 'test/fixtures/holtfs/.holt');
 ----
-IO Error: holtfs index_path must not be inside source_path
+IO Error: holtfs index_path must not be source_path or a path inside it
+
+statement error
+SELECT *
+FROM holtfs_index('test/fixtures/holtfs/',
+                  mode := 'persistent',
+                  index_path := 'test/fixtures/holtfs/.holt');
+----
+IO Error: holtfs index_path must not be source_path or a path inside it
+
+statement error
+SELECT *
+FROM holtfs_index('test/fixtures/holtfs/**/*.parquet',
+                  mode := 'persistent',
+                  index_path := 'test/fixtures/holtfs/.holt');
+----
+IO Error: holtfs index_path must not be source_path or a path inside it
+
+statement ok
+COPY (SELECT 'keep') TO '{TEMP_DIR}/holtfs_not_an_index' (FORMAT CSV, HEADER false);
+
+statement error
+SELECT *
+FROM holtfs_index('test/fixtures/holtfs',
+                  mode := 'persistent',
+                  index_path := '{TEMP_DIR}/holtfs_not_an_index');
+----
+IO Error: holtfs persistent index not found or incomplete
+
+query I
+SELECT count(*) FROM read_csv('{TEMP_DIR}/holtfs_not_an_index', header := false);
+----
+1
 
 query I
 SELECT indexed_files
@@ -62,15 +99,12 @@ FROM holtfs_status('/tmp/duckdb_holtfs_sql_index',
 ----
 1	1	3	0
 
-query III
-SELECT CAST(has_manifest AS INTEGER),
-       CAST(source_exists AS INTEGER),
-       CAST(is_stale AS INTEGER)
-FROM holtfs_status('/tmp/duckdb_holtfs_empty_status',
-                   mode := 'persistent',
-                   max_age_seconds := 3600);
+statement error
+SELECT *
+FROM holtfs_status('{TEMP_DIR}/duckdb_holtfs_missing_status',
+                   mode := 'persistent');
 ----
-0	0	1
+IO Error: holtfs persistent index not found or incomplete: {TEMP_DIR}/duckdb_holtfs_missing_status
 
 query I
 SELECT count(*)
@@ -131,6 +165,33 @@ FROM holtfs_refresh('test/fixtures/holtfs',
                     prefix := 'bucket/table/date=2026-05-22');
 ----
 1	0	3
+
+statement error
+SELECT *
+FROM holtfs_refresh('test/fixtures/holtfs',
+                    '/tmp/duckdb_holtfs_sql_index',
+                    mode := 'persistent',
+                    prefix := '../outside');
+----
+IO Error: holtfs_refresh prefix must stay within source_path
+
+statement error
+SELECT *
+FROM holtfs_refresh('test/fixtures/holtfs',
+                    '/tmp/duckdb_holtfs_sql_index',
+                    mode := 'persistent',
+                    prefix := '/tmp');
+----
+IO Error: holtfs_refresh prefix must stay within source_path
+
+statement error
+SELECT *
+FROM holtfs_refresh('test/fixtures/holtfs',
+                    '/tmp/duckdb_holtfs_sql_index',
+                    mode := 'persistent',
+                    prefix := 'bucket/*');
+----
+IO Error: holtfs_refresh prefix must not contain a glob
 
 statement error
 SELECT *
@@ -219,6 +280,31 @@ FROM holt_files('fixture_memory',
 ----
 3
 
+concurrentloop threadid 0 6
+
+loop i 0 20
+
+onlyif threadid=0
+statement ok
+SELECT *
+FROM holtfs_refresh('test/fixtures/holtfs',
+                    'fixture_memory',
+                    mode := 'memory',
+                    prefix := 'bucket/table/date=2026-05-22');
+
+skipif threadid=0
+query I
+SELECT count(*)
+FROM holt_files('fixture_memory',
+                mode := 'memory')
+WHERE entry_type = 'key';
+----
+3
+
+endloop
+
+endloop
+
 statement ok
 COPY (SELECT 42::INTEGER AS id, 'holt'::VARCHAR AS tag)
 TO '{TEMP_DIR}/holtfs_one.parquet' (FORMAT PARQUET);
@@ -264,6 +350,52 @@ FROM holt_parquet_scan('parquet_memory',
 IO Error: holt_parquet_scan found no Parquet files for prefix: {TEMP_DIR}/missing/
 
 statement ok
+COPY (SELECT 1::INTEGER AS id)
+TO '{TEMP_DIR}/holtfs_bound_1.parquet' (FORMAT PARQUET);
+
+query I
+SELECT indexed_files
+FROM holtfs_index('{TEMP_DIR}/holtfs_bound_*.parquet',
+                  mode := 'memory',
+                  name := 'bound_plan_memory');
+----
+1
+
+statement ok
+PREPARE holtfs_bound_plan AS
+SELECT count(*) FROM holt_parquet_scan('bound_plan_memory', mode := 'memory');
+
+query I
+EXECUTE holtfs_bound_plan;
+----
+1
+
+statement ok
+COPY (SELECT 2::INTEGER AS id)
+TO '{TEMP_DIR}/holtfs_bound_2.parquet' (FORMAT PARQUET);
+
+query I
+SELECT indexed_files
+FROM holtfs_rebuild('{TEMP_DIR}/holtfs_bound_*.parquet',
+                    'bound_plan_memory',
+                    mode := 'memory');
+----
+2
+
+query I
+EXECUTE holtfs_bound_plan;
+----
+2
+
+query I
+SELECT count(*) FROM holt_parquet_scan('bound_plan_memory', mode := 'memory');
+----
+2
+
+statement ok
+DEALLOCATE holtfs_bound_plan;
+
+statement ok
 COPY (
   SELECT 1::INTEGER AS id, '2026-05-22'::VARCHAR AS ds
   UNION ALL
@@ -295,6 +427,15 @@ FROM holt_parquet_scan('/tmp/duckdb_holtfs_glob_index',
                        prefix := '{TEMP_DIR}/holtfs_glob_lake/');
 ----
 3
+
+query I
+SELECT count(*)
+FROM holt_parquet_scan('/tmp/duckdb_holtfs_glob_index',
+                       mode := 'persistent',
+                       prefix := '{TEMP_DIR}/holtfs_glob_lake/',
+                       max_files := 1);
+----
+1
 
 query I
 SELECT indexed_files

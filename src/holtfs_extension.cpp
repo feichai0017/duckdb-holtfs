@@ -20,9 +20,12 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <exception>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -85,32 +88,75 @@ struct HoltTreeHandle {
 
 using HoltTreeRef = std::shared_ptr<HoltTreeHandle>;
 
-class MemoryIndexRegistry {
+struct IndexSlot {
+	std::mutex writer_mutex;
+	std::shared_mutex tree_mutex;
+	HoltTreeRef tree;
+};
+
+using IndexSlotRef = std::shared_ptr<IndexSlot>;
+
+static string NormalizeLocalPath(const string &path) {
+	if (path.empty() || FileSystem::IsRemoteFile(path) || FileSystem::HasGlob(path)) {
+		throw IOException("holtfs persistent index_ref must be a local path without glob characters");
+	}
+	std::error_code error;
+	auto absolute = std::filesystem::absolute(std::filesystem::path(path), error);
+	if (error) {
+		throw IOException("failed to resolve local path '" + path + "': " + error.message());
+	}
+
+	auto canonical = std::filesystem::weakly_canonical(absolute, error);
+	if (error) {
+		throw IOException("failed to canonicalize local path '" + path + "': " + error.message());
+	}
+	return canonical.lexically_normal().string();
+}
+
+class IndexRegistry {
 public:
-	void Publish(const string &name, HoltTreeRef handle) {
+	IndexSlotRef GetMemory(const string &name) {
 		if (name.empty()) {
 			throw BinderException("holtfs memory index requires name");
 		}
 		std::lock_guard<std::mutex> lock(mu);
-		indexes[name] = handle;
-	}
-
-	HoltTreeRef Get(const string &name) {
-		std::lock_guard<std::mutex> lock(mu);
-		auto entry = indexes.find(name);
-		if (entry == indexes.end()) {
+		auto entry = memory_indexes.find(name);
+		if (entry == memory_indexes.end()) {
 			throw IOException("holtfs memory index not found: " + name);
 		}
 		return entry->second;
 	}
 
+	IndexSlotRef GetOrCreateMemory(const string &name) {
+		if (name.empty()) {
+			throw BinderException("holtfs memory index requires name");
+		}
+		std::lock_guard<std::mutex> lock(mu);
+		auto &slot = memory_indexes[name];
+		if (!slot) {
+			slot = std::make_shared<IndexSlot>();
+		}
+		return slot;
+	}
+
+	IndexSlotRef GetPersistent(const string &path) {
+		auto normalized = NormalizeLocalPath(path);
+		std::lock_guard<std::mutex> lock(mu);
+		auto &slot = persistent_indexes[normalized];
+		if (!slot) {
+			slot = std::make_shared<IndexSlot>();
+		}
+		return slot;
+	}
+
 private:
 	std::mutex mu;
-	std::unordered_map<string, HoltTreeRef> indexes;
+	std::unordered_map<string, IndexSlotRef> memory_indexes;
+	std::unordered_map<string, IndexSlotRef> persistent_indexes;
 };
 
-static MemoryIndexRegistry &MemoryIndexes() {
-	static MemoryIndexRegistry registry;
+static IndexRegistry &Indexes() {
+	static IndexRegistry registry;
 	return registry;
 }
 
@@ -122,57 +168,75 @@ static string HoltfsLastError(const char *op) {
 	return string(op) + " failed: " + msg;
 }
 
+static string ExceptionMessage(const std::exception_ptr &error) {
+	try {
+		std::rethrow_exception(error);
+	} catch (const std::exception &exception) {
+		return exception.what();
+	} catch (...) {
+		return "unknown error";
+	}
+}
+
 static void OpenPersistentTree(const string &path, bool wal_sync, HoltTree **out) {
 	if (holt_tree_open_with_wal_sync(path.c_str(), wal_sync ? 1 : 0, out) != HOLT_OK) {
 		throw IOException(HoltfsLastError("holt_tree_open_with_wal_sync"));
 	}
 }
 
-struct OpenIndexTree {
-	OpenIndexTree() = default;
-
-	OpenIndexTree(OpenIndexTree &&other) noexcept
-	    : owned_tree(other.owned_tree), memory_tree(std::move(other.memory_tree)) {
-		other.owned_tree = nullptr;
+static bool PersistentIndexArtifactsExist(FileSystem &fs, const string &path) {
+	if (!fs.DirectoryExists(path) || !fs.FileExists(fs.JoinPath(path, "blobs.dat"))) {
+		return false;
 	}
+	return fs.FileExists(fs.JoinPath(path, "manifest.bin")) || fs.FileExists(fs.JoinPath(path, "manifest.log"));
+}
 
-	OpenIndexTree &operator=(OpenIndexTree &&other) noexcept {
-		if (this != &other) {
-			if (owned_tree) {
-				holt_tree_close(owned_tree);
-			}
-			owned_tree = other.owned_tree;
-			memory_tree = std::move(other.memory_tree);
-			other.owned_tree = nullptr;
-		}
-		return *this;
+static void RequirePersistentIndex(FileSystem &fs, const string &path) {
+	if (!PersistentIndexArtifactsExist(fs, path)) {
+		throw IOException("holtfs persistent index not found or incomplete: " + path);
 	}
+}
 
-	~OpenIndexTree() {
-		if (owned_tree) {
-			holt_tree_close(owned_tree);
-		}
+static HoltTreeRef OpenPersistentTreeExisting(FileSystem &fs, const string &path) {
+	RequirePersistentIndex(fs, path);
+	HoltTree *tree = nullptr;
+	OpenPersistentTree(path, false, &tree);
+	return std::make_shared<HoltTreeHandle>(tree);
+}
+
+struct IndexReadLease {
+	IndexReadLease(IndexSlotRef slot, std::shared_lock<std::shared_mutex> lock, HoltTreeRef tree)
+	    : slot(std::move(slot)), lock(std::move(lock)), tree(std::move(tree)) {
 	}
-
-	OpenIndexTree(const OpenIndexTree &) = delete;
-	OpenIndexTree &operator=(const OpenIndexTree &) = delete;
 
 	HoltTree *Tree() const {
-		return memory_tree ? memory_tree->tree : owned_tree;
+		return tree->tree;
 	}
 
-	HoltTree *owned_tree = nullptr;
-	HoltTreeRef memory_tree;
+	IndexSlotRef slot;
+	std::shared_lock<std::shared_mutex> lock;
+	HoltTreeRef tree;
 };
 
-static OpenIndexTree OpenIndexForRead(const string &index_ref, IndexMode mode) {
-	OpenIndexTree index;
-	if (mode == IndexMode::PERSISTENT) {
-		OpenPersistentTree(index_ref, false, &index.owned_tree);
-	} else {
-		index.memory_tree = MemoryIndexes().Get(index_ref);
+static IndexReadLease OpenIndexForRead(FileSystem &fs, const string &index_ref, IndexMode mode) {
+	auto slot = mode == IndexMode::PERSISTENT ? Indexes().GetPersistent(index_ref) : Indexes().GetMemory(index_ref);
+	while (true) {
+		std::shared_lock<std::shared_mutex> read_lock(slot->tree_mutex);
+		if (slot->tree) {
+			return IndexReadLease(slot, std::move(read_lock), slot->tree);
+		}
+		read_lock.unlock();
+
+		if (mode == IndexMode::MEMORY) {
+			throw IOException("holtfs memory index is not initialized: " + index_ref);
+		}
+
+		std::lock_guard<std::mutex> writer_lock(slot->writer_mutex);
+		std::unique_lock<std::shared_mutex> tree_lock(slot->tree_mutex);
+		if (!slot->tree) {
+			slot->tree = OpenPersistentTreeExisting(fs, index_ref);
+		}
 	}
-	return index;
 }
 
 static string InternalKeyPrefix() {
@@ -246,6 +310,7 @@ static bool GetU64(HoltTree *tree, const char *key, uint64_t &value) {
 
 struct IndexManifest {
 	bool exists = false;
+	string format_version;
 	string source_path;
 	uint64_t built_at_us = 0;
 	uint64_t refreshed_at_us = 0;
@@ -253,16 +318,30 @@ struct IndexManifest {
 	uint64_t indexed_bytes = 0;
 };
 
+static uint64_t RequireManifestU64(HoltTree *tree, const char *key) {
+	uint64_t value = 0;
+	if (!GetU64(tree, key, value)) {
+		throw IOException("holtfs index manifest is missing field: " + string(key));
+	}
+	return value;
+}
+
 static IndexManifest ReadManifest(HoltTree *tree) {
 	IndexManifest manifest;
 	manifest.exists = GetString(tree, InternalKey("source_path"), manifest.source_path);
 	if (!manifest.exists) {
 		return manifest;
 	}
-	GetU64(tree, "built_at_us", manifest.built_at_us);
-	GetU64(tree, "refreshed_at_us", manifest.refreshed_at_us);
-	GetU64(tree, "indexed_files", manifest.indexed_files);
-	GetU64(tree, "indexed_bytes", manifest.indexed_bytes);
+	if (!GetString(tree, InternalKey("format_version"), manifest.format_version)) {
+		throw IOException("holtfs index manifest is missing field: format_version");
+	}
+	if (manifest.format_version != "1") {
+		throw IOException("holtfs index format is not supported: " + manifest.format_version);
+	}
+	manifest.built_at_us = RequireManifestU64(tree, "built_at_us");
+	manifest.refreshed_at_us = RequireManifestU64(tree, "refreshed_at_us");
+	manifest.indexed_files = RequireManifestU64(tree, "indexed_files");
+	manifest.indexed_bytes = RequireManifestU64(tree, "indexed_bytes");
 	return manifest;
 }
 
@@ -274,6 +353,14 @@ static void WriteManifest(HoltTree *tree, const string &source_path, uint64_t bu
 	PutU64(tree, "refreshed_at_us", refreshed_at_us);
 	PutU64(tree, "indexed_files", indexed_files);
 	PutU64(tree, "indexed_bytes", indexed_bytes);
+}
+
+static void RequireHoltfsPersistentIndex(FileSystem &fs, const string &path) {
+	auto handle = OpenPersistentTreeExisting(fs, path);
+	auto manifest = ReadManifest(handle->tree);
+	if (!manifest.exists) {
+		throw IOException("holtfs refuses to replace a path without a HoltFS manifest: " + path);
+	}
 }
 
 struct HoltfsFilesBindData : public TableFunctionData {
@@ -341,17 +428,13 @@ struct HoltfsFilesGlobalState : public GlobalTableFunctionState {
 		if (iter) {
 			holt_iter_close(iter);
 		}
-		if (owned_tree) {
-			holt_tree_close(owned_tree);
-		}
 	}
 
 	HoltTree *Tree() {
-		return memory_tree ? memory_tree->tree : owned_tree;
+		return index->Tree();
 	}
 
-	HoltTree *owned_tree = nullptr;
-	HoltTreeRef memory_tree;
+	unique_ptr<IndexReadLease> index;
 	HoltIter *iter = nullptr;
 	idx_t emitted = 0;
 };
@@ -374,15 +457,11 @@ static int32_t DelimiterByte(const HoltfsFilesBindData &bind) {
 	return static_cast<unsigned char>(bind.delimiter[0]);
 }
 
-static unique_ptr<GlobalTableFunctionState> HoltfsFilesInit(ClientContext &, TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> HoltfsFilesInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->CastNoConst<HoltfsFilesBindData>();
 	auto state = make_uniq<HoltfsFilesGlobalState>();
-
-	if (bind.mode == IndexMode::PERSISTENT) {
-		OpenPersistentTree(bind.index_ref, false, &state->owned_tree);
-	} else {
-		state->memory_tree = MemoryIndexes().Get(bind.index_ref);
-	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	state->index = make_uniq<IndexReadLease>(OpenIndexForRead(fs, bind.index_ref, bind.mode));
 
 	auto prefix = reinterpret_cast<const uint8_t *>(bind.prefix.data());
 	auto start_after = OptionalData(bind.start_after);
@@ -649,13 +728,40 @@ static void IndexPath(FileSystem &fs, HoltTree *tree, const string &source, uint
 	}
 }
 
-static void ValidateIndexLocation(const string &source, const string &index_path) {
-	if (source == index_path) {
-		throw IOException("holtfs index_path must differ from source_path");
+static bool IsPathWithin(const std::filesystem::path &path, const std::filesystem::path &parent) {
+	auto path_it = path.begin();
+	for (auto parent_it = parent.begin(); parent_it != parent.end(); ++parent_it, ++path_it) {
+		if (path_it == path.end() || *path_it != *parent_it) {
+			return false;
+		}
 	}
-	if (index_path.size() > source.size() && index_path.compare(0, source.size(), source) == 0 &&
-	    (index_path[source.size()] == '/' || index_path[source.size()] == '\\')) {
-		throw IOException("holtfs index_path must not be inside source_path");
+	return true;
+}
+
+static string LocalSourceBoundary(const string &source) {
+	if (!FileSystem::HasGlob(source)) {
+		return source;
+	}
+	auto glob = source.find_first_of("*?[");
+	auto separator = source.find_last_of("/\\", glob);
+	if (separator == string::npos) {
+		return ".";
+	}
+	return source.substr(0, separator + 1);
+}
+
+static void ValidateIndexLocation(const string &source, const string &index_path) {
+	if (FileSystem::IsRemoteFile(source)) {
+		if (source == index_path) {
+			throw IOException("holtfs index_path must differ from source_path");
+		}
+		return;
+	}
+
+	auto normalized_source = std::filesystem::path(NormalizeLocalPath(LocalSourceBoundary(source)));
+	auto normalized_index = std::filesystem::path(NormalizeLocalPath(index_path));
+	if (IsPathWithin(normalized_index, normalized_source)) {
+		throw IOException("holtfs index_path must not be source_path or a path inside it");
 	}
 }
 
@@ -667,12 +773,23 @@ static void RemovePathIfExists(FileSystem &fs, const string &path) {
 	}
 }
 
+static bool PathExists(FileSystem &fs, const string &path) {
+	return fs.DirectoryExists(path) || fs.FileExists(path);
+}
+
 static string BuildTempIndexPath(const string &index_path) {
 	auto now = std::chrono::steady_clock::now().time_since_epoch().count();
 	return index_path + ".building." + std::to_string(now);
 }
 
+static string BuildBackupIndexPath(const string &index_path) {
+	return index_path + ".previous";
+}
+
 static void BuildMemoryIndex(FileSystem &fs, const HoltfsIndexBindData &bind, uint64_t &files, uint64_t &bytes) {
+	auto slot = Indexes().GetOrCreateMemory(bind.name);
+	std::lock_guard<std::mutex> writer_lock(slot->writer_mutex);
+
 	HoltTree *tree = nullptr;
 	if (holt_tree_open_memory(&tree) != HOLT_OK) {
 		throw IOException(HoltfsLastError("holt_tree_open_memory"));
@@ -681,17 +798,45 @@ static void BuildMemoryIndex(FileSystem &fs, const HoltfsIndexBindData &bind, ui
 	IndexPath(fs, handle->tree, bind.source_path, files, bytes);
 	auto now = NowMicros();
 	WriteManifest(handle->tree, bind.source_path, now, now, files, bytes);
-	MemoryIndexes().Publish(bind.name, handle);
+
+	std::unique_lock<std::shared_mutex> tree_lock(slot->tree_mutex);
+	slot->tree = std::move(handle);
 }
 
 static void BuildPersistentIndex(FileSystem &fs, const HoltfsIndexBindData &bind, uint64_t &files, uint64_t &bytes) {
-	ValidateIndexLocation(bind.source_path, bind.index_path);
-	auto temp_path = BuildTempIndexPath(bind.index_path);
-	RemovePathIfExists(fs, temp_path);
+	auto index_path = NormalizeLocalPath(bind.index_path);
+	ValidateIndexLocation(bind.source_path, index_path);
+	auto slot = Indexes().GetPersistent(index_path);
+	std::lock_guard<std::mutex> writer_lock(slot->writer_mutex);
+	auto temp_path = BuildTempIndexPath(index_path);
+	auto backup_path = BuildBackupIndexPath(index_path);
 
-	HoltTree *tree = nullptr;
-	OpenPersistentTree(temp_path, false, &tree);
+	{
+		std::unique_lock<std::shared_mutex> tree_lock(slot->tree_mutex);
+		if (!PathExists(fs, index_path) && PathExists(fs, backup_path)) {
+			RequireHoltfsPersistentIndex(fs, backup_path);
+			fs.MoveFile(backup_path, index_path);
+			slot->tree = OpenPersistentTreeExisting(fs, index_path);
+		} else if (PathExists(fs, index_path)) {
+			if (!slot->tree) {
+				slot->tree = OpenPersistentTreeExisting(fs, index_path);
+			}
+			if (!ReadManifest(slot->tree->tree).exists) {
+				throw IOException("holtfs refuses to replace a path without a HoltFS manifest: " + index_path);
+			}
+			if (PathExists(fs, backup_path)) {
+				RequireHoltfsPersistentIndex(fs, backup_path);
+				RemovePathIfExists(fs, backup_path);
+			}
+		}
+	}
+	if (PathExists(fs, temp_path)) {
+		throw IOException("holtfs temporary index path already exists: " + temp_path);
+	}
+
 	try {
+		HoltTree *tree = nullptr;
+		OpenPersistentTree(temp_path, false, &tree);
 		HoltTreeHandle handle(tree);
 		IndexPath(fs, handle.tree, bind.source_path, files, bytes);
 		auto now = NowMicros();
@@ -705,8 +850,46 @@ static void BuildPersistentIndex(FileSystem &fs, const HoltfsIndexBindData &bind
 		throw;
 	}
 
-	RemovePathIfExists(fs, bind.index_path);
-	fs.MoveFile(temp_path, bind.index_path);
+	std::unique_lock<std::shared_mutex> tree_lock(slot->tree_mutex);
+	slot->tree.reset();
+	auto had_previous = PathExists(fs, index_path);
+	bool previous_moved = false;
+	bool candidate_published = false;
+	try {
+		if (had_previous) {
+			RemovePathIfExists(fs, backup_path);
+			fs.MoveFile(index_path, backup_path);
+			previous_moved = true;
+		}
+		fs.MoveFile(temp_path, index_path);
+		candidate_published = true;
+		auto published = OpenPersistentTreeExisting(fs, index_path);
+		slot->tree = std::move(published);
+		if (had_previous) {
+			RemovePathIfExists(fs, backup_path);
+		}
+	} catch (...) {
+		auto publish_error = std::current_exception();
+		try {
+			slot->tree.reset();
+			if (candidate_published && PathExists(fs, index_path)) {
+				fs.MoveFile(index_path, temp_path);
+			}
+			if (previous_moved && PathExists(fs, backup_path)) {
+				fs.MoveFile(backup_path, index_path);
+			}
+			if (had_previous && PathExists(fs, index_path)) {
+				slot->tree = OpenPersistentTreeExisting(fs, index_path);
+			}
+			RemovePathIfExists(fs, temp_path);
+		} catch (...) {
+			auto rollback_error = std::current_exception();
+			throw IOException("holtfs index publish failed and rollback also failed; publish error: " +
+			                  ExceptionMessage(publish_error) +
+			                  "; rollback error: " + ExceptionMessage(rollback_error));
+		}
+		std::rethrow_exception(publish_error);
+	}
 }
 
 static void HoltfsIndexFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -763,10 +946,31 @@ static string ResolveSubtreePath(FileSystem &fs, const string &source_path, cons
 	if (prefix.empty()) {
 		return source_path;
 	}
-	if (LooksLikeAbsolutePath(prefix)) {
-		return prefix;
+	if (FileSystem::HasGlob(prefix)) {
+		throw IOException("holtfs_refresh prefix must not contain a glob");
 	}
-	return fs.JoinPath(source_path, prefix);
+	if (FileSystem::IsRemoteFile(source_path)) {
+		throw IOException("holtfs_refresh prefix refresh is not supported for remote source_path; rebuild the index");
+	}
+
+	auto source = std::filesystem::path(source_path).lexically_normal();
+	auto candidate =
+	    LooksLikeAbsolutePath(prefix) ? std::filesystem::path(prefix) : (source / std::filesystem::path(prefix));
+	auto canonical_source = std::filesystem::path(NormalizeLocalPath(source.string()));
+	auto canonical_candidate = std::filesystem::path(NormalizeLocalPath(candidate.lexically_normal().string()));
+	if (!IsPathWithin(canonical_candidate, canonical_source)) {
+		throw IOException("holtfs_refresh prefix must stay within source_path");
+	}
+	if (canonical_candidate == canonical_source) {
+		return fs.ConvertSeparators(source.string());
+	}
+
+	std::error_code error;
+	auto relative = std::filesystem::relative(canonical_candidate, canonical_source, error);
+	if (error) {
+		throw IOException("failed to resolve holtfs_refresh prefix: " + error.message());
+	}
+	return fs.ConvertSeparators((source / relative).lexically_normal().string());
 }
 
 struct CollectedFiles {
@@ -780,31 +984,42 @@ static CollectedFiles CollectSourceFiles(FileSystem &fs, const string &source) {
 	CollectedFiles result;
 	result.source_exists = ExpandSourceFiles(fs, source, [&](const string &path) {
 		auto file = ReadFileMetadata(fs, path);
+		if (!result.keys.insert(file.key).second) {
+			return;
+		}
 		result.bytes += file.size;
-		result.keys.insert(file.key);
 		result.files.push_back(std::move(file));
 	});
 	return result;
 }
 
+struct HoltIterHandle {
+	~HoltIterHandle() {
+		if (iter) {
+			holt_iter_close(iter);
+		}
+	}
+
+	HoltIter *iter = nullptr;
+};
+
 template <class RecordCallback>
 static void ScanIndexRecordsFrom(HoltTree *tree, const string &prefix, const string &start_after,
                                  RecordCallback callback) {
-	HoltIter *iter = nullptr;
+	HoltIterHandle handle;
 	auto rc = holt_tree_scan_records(tree, reinterpret_cast<const uint8_t *>(prefix.data()), prefix.size(), -1,
-	                                 OptionalData(start_after), OptionalSize(start_after), &iter);
+	                                 OptionalData(start_after), OptionalSize(start_after), &handle.iter);
 	if (rc != HOLT_OK) {
 		throw IOException(HoltfsLastError("holt_tree_scan_records"));
 	}
 
 	while (true) {
 		HoltEntry entry;
-		rc = holt_iter_next(iter, &entry);
+		rc = holt_iter_next(handle.iter, &entry);
 		if (rc == HOLT_ITER_END) {
 			break;
 		}
 		if (rc != HOLT_OK) {
-			holt_iter_close(iter);
 			throw IOException(HoltfsLastError("holt_iter_next"));
 		}
 
@@ -817,7 +1032,39 @@ static void ScanIndexRecordsFrom(HoltTree *tree, const string &prefix, const str
 			holt_entry_free(&entry);
 		}
 	}
-	holt_iter_close(iter);
+}
+
+template <class KeyCallback>
+static void ScanIndexKeysFrom(HoltTree *tree, const string &prefix, const string &start_after, KeyCallback callback) {
+	HoltIterHandle handle;
+	auto rc = holt_tree_scan_keys(tree, reinterpret_cast<const uint8_t *>(prefix.data()), prefix.size(), -1,
+	                              OptionalData(start_after), OptionalSize(start_after), &handle.iter);
+	if (rc != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_scan_keys"));
+	}
+
+	while (true) {
+		HoltEntry entry;
+		rc = holt_iter_next(handle.iter, &entry);
+		if (rc == HOLT_ITER_END) {
+			break;
+		}
+		if (rc != HOLT_OK) {
+			throw IOException(HoltfsLastError("holt_iter_next"));
+		}
+
+		bool keep_scanning = true;
+		if (entry.kind == HOLT_ENTRY_KEY) {
+			auto key = BytesToString(entry.path);
+			holt_entry_free(&entry);
+			keep_scanning = callback(key);
+		} else {
+			holt_entry_free(&entry);
+		}
+		if (!keep_scanning) {
+			break;
+		}
+	}
 }
 
 template <class RecordCallback>
@@ -840,30 +1087,23 @@ static uint64_t MetadataSize(const string &value) {
 	}
 }
 
-struct IndexContentStats {
-	uint64_t files = 0;
+struct IndexRecordSnapshot {
+	vector<IndexedFile> files;
+	std::unordered_map<string, string> values;
 	uint64_t bytes = 0;
 };
 
-static IndexContentStats CountIndexContent(HoltTree *tree) {
-	IndexContentStats stats;
-	ScanIndexRecords(tree, string(), [&](const string &key, const string &value) {
-		if (!IsInternalKey(key)) {
-			stats.files++;
-			stats.bytes += MetadataSize(value);
-		}
-	});
-	return stats;
-}
-
-static vector<string> CollectIndexedKeys(HoltTree *tree, const string &prefix) {
-	vector<string> keys;
-	ScanIndexRecords(tree, prefix, [&](const string &key, const string &) {
+static IndexRecordSnapshot CollectIndexedRecords(HoltTree *tree, const string &prefix) {
+	IndexRecordSnapshot snapshot;
+	ScanIndexRecords(tree, prefix, [&](const string &key, const string &value) {
 		if (!IsInternalKey(key) && IsUnderSourcePath(key, prefix)) {
-			keys.push_back(key);
+			auto size = MetadataSize(value);
+			snapshot.files.push_back({key, value, size});
+			snapshot.values.emplace(key, value);
+			snapshot.bytes += size;
 		}
 	});
-	return keys;
+	return snapshot;
 }
 
 struct OptionalNamedParameter {
@@ -920,18 +1160,16 @@ static void ReadParquetScanNamedParameters(TableFunctionBindInput &input, Holtfs
 	}
 }
 
-static vector<string> CollectParquetFiles(const HoltfsParquetScanBindData &bind) {
-	auto index = OpenIndexForRead(bind.index_ref, bind.mode);
+static vector<string> CollectParquetFiles(FileSystem &fs, const HoltfsParquetScanBindData &bind) {
+	auto index = OpenIndexForRead(fs, bind.index_ref, bind.mode);
 	vector<string> files;
-	ScanIndexRecordsFrom(index.Tree(), bind.prefix, bind.start_after, [&](const string &key, const string &) {
+	ScanIndexKeysFrom(index.Tree(), bind.prefix, bind.start_after, [&](const string &key) {
 		if (IsInternalKey(key) || !IsParquetDataFile(key)) {
-			return;
+			return true;
 		}
 		files.push_back(key);
+		return !bind.max_files || files.size() < bind.max_files;
 	});
-	if (bind.max_files && files.size() > bind.max_files) {
-		files.resize(bind.max_files);
-	}
 	return files;
 }
 
@@ -950,7 +1188,7 @@ static void AddNamedParameter(vector<unique_ptr<ParsedExpression>> &children, co
 	children.push_back(std::move(expression));
 }
 
-static unique_ptr<TableRef> HoltParquetScanBindReplace(ClientContext &, TableFunctionBindInput &input) {
+static unique_ptr<TableRef> HoltParquetScanBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	if (input.inputs.size() != 1) {
 		throw BinderException("holt_parquet_scan(index_ref, ...) expects exactly one VARCHAR argument");
 	}
@@ -959,7 +1197,8 @@ static unique_ptr<TableRef> HoltParquetScanBindReplace(ClientContext &, TableFun
 	bind.index_ref = StringValue::Get(input.inputs[0]);
 	ReadParquetScanNamedParameters(input, bind);
 
-	auto files = CollectParquetFiles(bind);
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto files = CollectParquetFiles(fs, bind);
 	if (files.empty()) {
 		throw IOException("holt_parquet_scan found no Parquet files for prefix: " + bind.prefix);
 	}
@@ -1070,10 +1309,10 @@ static void HoltfsStatusFunction(ClientContext &context, TableFunctionInput &inp
 	}
 	state.done = true;
 
-	auto index = OpenIndexForRead(bind.index_ref, bind.mode);
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto index = OpenIndexForRead(fs, bind.index_ref, bind.mode);
 	auto tree = index.Tree();
 	auto manifest = ReadManifest(tree);
-	auto &fs = FileSystem::GetFileSystem(context);
 	auto source_exists =
 	    manifest.exists && (!SourceHasCheapExistenceCheck(manifest.source_path) ||
 	                        fs.FileExists(manifest.source_path) || fs.DirectoryExists(manifest.source_path));
@@ -1176,21 +1415,19 @@ static unique_ptr<GlobalTableFunctionState> HoltfsRefreshInit(ClientContext &, T
 	return make_uniq<HoltfsRefreshGlobalState>();
 }
 
-static uint64_t DeleteStaleKeys(HoltTree *tree, const vector<string> &old_keys,
-                                const std::unordered_set<string> &current_keys) {
-	uint64_t removed = 0;
-	for (auto &key : old_keys) {
-		if (current_keys.find(key) != current_keys.end()) {
-			continue;
-		}
-		uint8_t existed = 0;
-		auto rc = holt_tree_delete(tree, reinterpret_cast<const uint8_t *>(key.data()), key.size(), &existed);
-		if (rc != HOLT_OK) {
-			throw IOException(HoltfsLastError("holt_tree_delete"));
-		}
-		removed += existed ? 1 : 0;
+static bool DeleteKey(HoltTree *tree, const string &key) {
+	uint8_t existed = 0;
+	auto rc = holt_tree_delete(tree, reinterpret_cast<const uint8_t *>(key.data()), key.size(), &existed);
+	if (rc != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_delete"));
 	}
-	return removed;
+	return existed != 0;
+}
+
+static void CheckpointTree(HoltTree *tree) {
+	if (holt_tree_checkpoint(tree) != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_checkpoint"));
+	}
 }
 
 static void CheckRefreshManifest(const IndexManifest &manifest, const string &source_path) {
@@ -1202,31 +1439,70 @@ static void CheckRefreshManifest(const IndexManifest &manifest, const string &so
 	}
 }
 
-static void RefreshPrefix(FileSystem &fs, HoltTree *tree, const HoltfsRefreshBindData &bind, const string &refresh_path,
-                          uint64_t &refreshed_files, uint64_t &refreshed_bytes, uint64_t &removed_keys,
-                          uint64_t &indexed_files, uint64_t &indexed_bytes) {
-	auto manifest = ReadManifest(tree);
-	CheckRefreshManifest(manifest, bind.source_path);
-
-	if (!fs.FileExists(bind.source_path) && !fs.DirectoryExists(bind.source_path)) {
-		throw IOException("holtfs_refresh source path is neither a file nor a directory: " + bind.source_path);
-	}
-
-	auto current = CollectSourceFiles(fs, refresh_path);
-	auto key_prefix = fs.ConvertSeparators(refresh_path);
-	auto old_keys = CollectIndexedKeys(tree, key_prefix);
+static void RestorePrefixSnapshot(HoltTree *tree, const CollectedFiles &current, const IndexRecordSnapshot &previous,
+                                  const IndexManifest &manifest, bool persistent) {
 	for (auto &file : current.files) {
+		if (previous.values.find(file.key) == previous.values.end()) {
+			DeleteKey(tree, file.key);
+		}
+	}
+	for (auto &file : previous.files) {
 		PutString(tree, file.key, file.value);
 	}
-	removed_keys = DeleteStaleKeys(tree, old_keys, current.keys);
-	auto content = CountIndexContent(tree);
-	auto now = NowMicros();
-	WriteManifest(tree, bind.source_path, manifest.built_at_us, now, content.files, content.bytes);
+	WriteManifest(tree, manifest.source_path, manifest.built_at_us, manifest.refreshed_at_us, manifest.indexed_files,
+	              manifest.indexed_bytes);
+	if (persistent) {
+		CheckpointTree(tree);
+	}
+}
+
+static void RefreshPrefix(HoltTree *tree, const HoltfsRefreshBindData &bind, const string &key_prefix,
+                          const CollectedFiles &current, const IndexManifest &manifest, uint64_t &refreshed_files,
+                          uint64_t &refreshed_bytes, uint64_t &removed_keys, uint64_t &indexed_files,
+                          uint64_t &indexed_bytes) {
+	auto previous = CollectIndexedRecords(tree, key_prefix);
+	if (manifest.indexed_files < previous.files.size() || manifest.indexed_bytes < previous.bytes) {
+		throw IOException("holtfs index manifest counters are inconsistent; rebuild the index");
+	}
+
+	indexed_files = manifest.indexed_files - previous.files.size() + current.files.size();
+	indexed_bytes = manifest.indexed_bytes - previous.bytes + current.bytes;
+	removed_keys = 0;
+	for (auto &file : previous.files) {
+		if (current.keys.find(file.key) == current.keys.end()) {
+			removed_keys++;
+		}
+	}
+
+	try {
+		for (auto &file : current.files) {
+			PutString(tree, file.key, file.value);
+		}
+		for (auto &file : previous.files) {
+			if (current.keys.find(file.key) == current.keys.end() && !DeleteKey(tree, file.key)) {
+				throw IOException("holtfs index changed while prefix refresh held ownership");
+			}
+		}
+		auto now = NowMicros();
+		WriteManifest(tree, bind.source_path, manifest.built_at_us, now, indexed_files, indexed_bytes);
+		if (bind.mode == IndexMode::PERSISTENT) {
+			CheckpointTree(tree);
+		}
+	} catch (...) {
+		auto refresh_error = std::current_exception();
+		try {
+			RestorePrefixSnapshot(tree, current, previous, manifest, bind.mode == IndexMode::PERSISTENT);
+		} catch (...) {
+			auto rollback_error = std::current_exception();
+			throw IOException(
+			    "holtfs_refresh failed and rollback also failed; refresh error: " + ExceptionMessage(refresh_error) +
+			    "; rollback error: " + ExceptionMessage(rollback_error));
+		}
+		std::rethrow_exception(refresh_error);
+	}
 
 	refreshed_files = current.files.size();
 	refreshed_bytes = current.bytes;
-	indexed_files = content.files;
-	indexed_bytes = content.bytes;
 }
 
 static void HoltfsRefreshFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -1262,19 +1538,42 @@ static void HoltfsRefreshFunction(ClientContext &context, TableFunctionInput &in
 		}
 		refreshed_files = indexed_files;
 		refreshed_bytes = indexed_bytes;
-	} else if (bind.mode == IndexMode::PERSISTENT) {
-		ValidateIndexLocation(bind.source_path, bind.index_ref);
-		HoltTree *tree = nullptr;
-		OpenPersistentTree(bind.index_ref, false, &tree);
-		HoltTreeHandle handle(tree);
-		RefreshPrefix(fs, handle.tree, bind, refresh_path, refreshed_files, refreshed_bytes, removed_keys,
-		              indexed_files, indexed_bytes);
-		if (holt_tree_checkpoint(handle.tree) != HOLT_OK) {
-			throw IOException(HoltfsLastError("holt_tree_checkpoint"));
-		}
 	} else {
-		auto handle = MemoryIndexes().Get(bind.index_ref);
-		RefreshPrefix(fs, handle->tree, bind, refresh_path, refreshed_files, refreshed_bytes, removed_keys,
+		IndexSlotRef slot;
+		if (bind.mode == IndexMode::PERSISTENT) {
+			ValidateIndexLocation(bind.source_path, bind.index_ref);
+			slot = Indexes().GetPersistent(bind.index_ref);
+		} else {
+			slot = Indexes().GetMemory(bind.index_ref);
+		}
+
+		std::lock_guard<std::mutex> writer_lock(slot->writer_mutex);
+		HoltTreeRef handle;
+		{
+			std::unique_lock<std::shared_mutex> tree_lock(slot->tree_mutex);
+			if (!slot->tree) {
+				if (bind.mode == IndexMode::PERSISTENT) {
+					slot->tree = OpenPersistentTreeExisting(fs, bind.index_ref);
+				} else {
+					throw IOException("holtfs memory index is not initialized: " + bind.index_ref);
+				}
+			}
+			handle = slot->tree;
+		}
+
+		if (!fs.FileExists(bind.source_path) && !fs.DirectoryExists(bind.source_path)) {
+			throw IOException("holtfs_refresh source path is neither a file nor a directory: " + bind.source_path);
+		}
+		auto current = CollectSourceFiles(fs, refresh_path);
+		auto key_prefix = fs.ConvertSeparators(refresh_path);
+
+		std::unique_lock<std::shared_mutex> tree_lock(slot->tree_mutex);
+		if (slot->tree != handle) {
+			throw IOException("holtfs index ownership changed during prefix refresh");
+		}
+		auto manifest = ReadManifest(handle->tree);
+		CheckRefreshManifest(manifest, bind.source_path);
+		RefreshPrefix(handle->tree, bind, key_prefix, current, manifest, refreshed_files, refreshed_bytes, removed_keys,
 		              indexed_files, indexed_bytes);
 	}
 
@@ -1431,9 +1730,9 @@ static void HoltfsValidateFunction(ClientContext &context, TableFunctionInput &i
 	}
 	state.done = true;
 
-	auto index = OpenIndexForRead(bind.index_ref, bind.mode);
-	auto tree = index.Tree();
 	auto &fs = FileSystem::GetFileSystem(context);
+	auto index = OpenIndexForRead(fs, bind.index_ref, bind.mode);
+	auto tree = index.Tree();
 	ValidationStats stats;
 	ValidateSourcePath(fs, tree, bind.source_path, stats);
 	CountIndexedFiles(fs, tree, bind.source_path, stats);

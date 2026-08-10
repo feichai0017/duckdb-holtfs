@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 
 set(TARGET_NAME holtfs)
 
@@ -65,6 +65,12 @@ set(EXTENSION_SOURCES src/holtfs_extension.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+set_target_properties(${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME}
+  PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
 
 target_include_directories(${EXTENSION_NAME} PRIVATE ${HOLT_FFI_INCLUDE_DIR})
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${HOLT_FFI_INCLUDE_DIR})
