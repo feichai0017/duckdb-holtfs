@@ -1415,15 +1415,6 @@ static unique_ptr<GlobalTableFunctionState> HoltfsRefreshInit(ClientContext &, T
 	return make_uniq<HoltfsRefreshGlobalState>();
 }
 
-static bool DeleteKey(HoltTree *tree, const string &key) {
-	uint8_t existed = 0;
-	auto rc = holt_tree_delete(tree, reinterpret_cast<const uint8_t *>(key.data()), key.size(), &existed);
-	if (rc != HOLT_OK) {
-		throw IOException(HoltfsLastError("holt_tree_delete"));
-	}
-	return existed != 0;
-}
-
 static void CheckpointTree(HoltTree *tree) {
 	if (holt_tree_checkpoint(tree) != HOLT_OK) {
 		throw IOException(HoltfsLastError("holt_tree_checkpoint"));
@@ -1439,18 +1430,64 @@ static void CheckRefreshManifest(const IndexManifest &manifest, const string &so
 	}
 }
 
+struct AtomicWrite {
+	uint32_t kind;
+	string key;
+	string value;
+};
+
+static void AddAtomicPut(vector<AtomicWrite> &writes, string key, string value) {
+	writes.push_back({HOLT_ATOMIC_PUT, std::move(key), std::move(value)});
+}
+
+static void AddAtomicDelete(vector<AtomicWrite> &writes, string key) {
+	writes.push_back({HOLT_ATOMIC_DELETE, std::move(key), string()});
+}
+
+static void AddAtomicManifest(vector<AtomicWrite> &writes, const string &source_path, uint64_t built_at_us,
+                              uint64_t refreshed_at_us, uint64_t indexed_files, uint64_t indexed_bytes) {
+	AddAtomicPut(writes, InternalKey("format_version"), "1");
+	AddAtomicPut(writes, InternalKey("source_path"), source_path);
+	AddAtomicPut(writes, InternalKey("built_at_us"), std::to_string(built_at_us));
+	AddAtomicPut(writes, InternalKey("refreshed_at_us"), std::to_string(refreshed_at_us));
+	AddAtomicPut(writes, InternalKey("indexed_files"), std::to_string(indexed_files));
+	AddAtomicPut(writes, InternalKey("indexed_bytes"), std::to_string(indexed_bytes));
+}
+
+static void ApplyAtomicWrites(HoltTree *tree, const vector<AtomicWrite> &writes) {
+	vector<HoltAtomicOp> ops;
+	ops.reserve(writes.size());
+	for (auto &write : writes) {
+		auto value = write.kind == HOLT_ATOMIC_PUT ? reinterpret_cast<const uint8_t *>(write.value.data()) : nullptr;
+		ops.push_back({write.kind, reinterpret_cast<const uint8_t *>(write.key.data()), write.key.size(), value,
+		               write.value.size()});
+	}
+
+	uint8_t committed = 0;
+	auto rc = holt_tree_atomic(tree, ops.empty() ? nullptr : ops.data(), ops.size(), &committed);
+	if (rc != HOLT_OK) {
+		throw IOException(HoltfsLastError("holt_tree_atomic"));
+	}
+	if (!committed) {
+		throw IOException("holt_tree_atomic rejected an unguarded batch");
+	}
+}
+
 static void RestorePrefixSnapshot(HoltTree *tree, const CollectedFiles &current, const IndexRecordSnapshot &previous,
                                   const IndexManifest &manifest, bool persistent) {
+	vector<AtomicWrite> writes;
+	writes.reserve(current.files.size() + previous.files.size() + 6);
 	for (auto &file : current.files) {
 		if (previous.values.find(file.key) == previous.values.end()) {
-			DeleteKey(tree, file.key);
+			AddAtomicDelete(writes, file.key);
 		}
 	}
 	for (auto &file : previous.files) {
-		PutString(tree, file.key, file.value);
+		AddAtomicPut(writes, file.key, file.value);
 	}
-	WriteManifest(tree, manifest.source_path, manifest.built_at_us, manifest.refreshed_at_us, manifest.indexed_files,
-	              manifest.indexed_bytes);
+	AddAtomicManifest(writes, manifest.source_path, manifest.built_at_us, manifest.refreshed_at_us,
+	                  manifest.indexed_files, manifest.indexed_bytes);
+	ApplyAtomicWrites(tree, writes);
 	if (persistent) {
 		CheckpointTree(tree);
 	}
@@ -1475,16 +1512,19 @@ static void RefreshPrefix(HoltTree *tree, const HoltfsRefreshBindData &bind, con
 	}
 
 	try {
+		vector<AtomicWrite> writes;
+		writes.reserve(current.files.size() + previous.files.size() + 6);
 		for (auto &file : current.files) {
-			PutString(tree, file.key, file.value);
+			AddAtomicPut(writes, file.key, file.value);
 		}
 		for (auto &file : previous.files) {
-			if (current.keys.find(file.key) == current.keys.end() && !DeleteKey(tree, file.key)) {
-				throw IOException("holtfs index changed while prefix refresh held ownership");
+			if (current.keys.find(file.key) == current.keys.end()) {
+				AddAtomicDelete(writes, file.key);
 			}
 		}
 		auto now = NowMicros();
-		WriteManifest(tree, bind.source_path, manifest.built_at_us, now, indexed_files, indexed_bytes);
+		AddAtomicManifest(writes, bind.source_path, manifest.built_at_us, now, indexed_files, indexed_bytes);
+		ApplyAtomicWrites(tree, writes);
 		if (bind.mode == IndexMode::PERSISTENT) {
 			CheckpointTree(tree);
 		}

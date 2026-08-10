@@ -315,21 +315,26 @@ Readers can continue on the old tree while HoltFS builds a full replacement.
 They wait only during publication.
 
 A prefix refresh collects the source subtree before it takes the exclusive
-tree lease. It then snapshots the old indexed subtree, applies puts and
-deletes, and checkpoints persistent trees.
+tree lease. It then snapshots the old indexed subtree.
 
 HoltFS updates manifest counters from the old and new subtree sizes. It no
 longer scans the full index to update those counters.
 
-If an ordinary error occurs after mutation starts, HoltFS restores the old
-key/value set and manifest before it releases readers. The restore can
-change Holt record-version tokens. It preserves logical content, not the
-old tokens.
+The refresh submits all puts, deletes, and manifest fields through one Holt
+atomic batch. HoltFS readers cannot observe an intermediate state. Persistent
+WAL replay recovers the old batch state or the complete new batch state.
 
-The pinned Holt C ABI does not expose atomic batches or a read-only open.
-Persistent read calls are non-creating, but the shared Holt handle still
-opens its files for write. After a process crash, Holt can reopen with a
-partial prefix refresh.
+HoltFS checkpoints a committed persistent batch. If the refresh or checkpoint
+fails, it restores the old key/value set and manifest through another atomic
+batch before it releases readers.
+
+The restore preserves logical content. It can change Holt record-version
+tokens.
+
+### Process boundaries
+
+The pinned Holt C ABI does not expose a read-only open. Persistent read calls
+are non-creating, but the shared Holt handle still opens its files for write.
 
 Do not use the same persistent index from multiple DuckDB processes when
 one of them can write. Use a full rebuild when you need the stronger publish
