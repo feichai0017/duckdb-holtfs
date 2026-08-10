@@ -425,13 +425,13 @@ static unique_ptr<FunctionData> HoltfsFilesBind(ClientContext &, TableFunctionBi
 	ReadFilesNamedParameters(input, *result);
 
 	names.emplace_back("entry_type");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("path");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("value");
-	return_types.emplace_back(LogicalType::BLOB);
+	return_types.emplace_back(LogicalType(LogicalTypeId::BLOB));
 	names.emplace_back("version");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 
 	return std::move(result);
 }
@@ -545,13 +545,14 @@ static void HoltfsFilesFunction(ClientContext &, TableFunctionInput &input, Data
 }
 
 static void RegisterHoltFiles(ExtensionLoader &loader) {
-	TableFunction function("holt_files", {LogicalType::VARCHAR}, HoltfsFilesFunction, HoltfsFilesBind, HoltfsFilesInit);
-	function.named_parameters["mode"] = LogicalType::VARCHAR;
-	function.named_parameters["prefix"] = LogicalType::VARCHAR;
-	function.named_parameters["delimiter"] = LogicalType::VARCHAR;
-	function.named_parameters["start_after"] = LogicalType::VARCHAR;
-	function.named_parameters["max_files"] = LogicalType::UBIGINT;
-	function.named_parameters["include_value"] = LogicalType::BOOLEAN;
+	TableFunction function("holt_files", {LogicalType(LogicalTypeId::VARCHAR)}, HoltfsFilesFunction, HoltfsFilesBind,
+	                       HoltfsFilesInit);
+	function.named_parameters["mode"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["prefix"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["delimiter"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["start_after"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["max_files"] = LogicalType(LogicalTypeId::UBIGINT);
+	function.named_parameters["include_value"] = LogicalType(LogicalTypeId::BOOLEAN);
 	loader.RegisterFunction(function);
 }
 
@@ -612,15 +613,15 @@ static unique_ptr<FunctionData> HoltfsIndexBind(ClientContext &, TableFunctionBi
 	}
 
 	names.emplace_back("source_path");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("mode");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("index_ref");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("indexed_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("indexed_bytes");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 
 	return std::move(result);
 }
@@ -640,7 +641,7 @@ struct IndexedFile {
 };
 
 static IndexedFile ReadFileMetadata(FileSystem &fs, const string &path) {
-	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	auto handle = fs.OpenFile(path, FileOpenFlags(FileOpenFlags::FILE_FLAGS_READ));
 	auto file_size = handle->GetFileSize();
 	if (file_size < 0) {
 		throw IOException("failed to stat file '" + path + "'");
@@ -932,11 +933,11 @@ static void HoltfsIndexFunction(ClientContext &context, TableFunctionInput &inpu
 }
 
 static void RegisterHoltfsIndex(ExtensionLoader &loader) {
-	TableFunction function("holtfs_index", {LogicalType::VARCHAR}, HoltfsIndexFunction, HoltfsIndexBind,
+	TableFunction function("holtfs_index", {LogicalType(LogicalTypeId::VARCHAR)}, HoltfsIndexFunction, HoltfsIndexBind,
 	                       HoltfsIndexInit);
-	function.named_parameters["mode"] = LogicalType::VARCHAR;
-	function.named_parameters["index_path"] = LogicalType::VARCHAR;
-	function.named_parameters["name"] = LogicalType::VARCHAR;
+	function.named_parameters["mode"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["index_path"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["name"] = LogicalType(LogicalTypeId::VARCHAR);
 	loader.RegisterFunction(function);
 }
 
@@ -1192,7 +1193,7 @@ static Value FileListValue(const vector<string> &files) {
 	for (auto &file : files) {
 		values.emplace_back(file);
 	}
-	return Value::LIST(LogicalType::VARCHAR, std::move(values));
+	return Value::LIST(LogicalType(LogicalTypeId::VARCHAR), std::move(values));
 }
 
 static void AddNamedParameter(vector<unique_ptr<ParsedExpression>> &children, const string &name, const Value &value) {
@@ -1234,15 +1235,15 @@ static unique_ptr<TableRef> HoltParquetScanBindReplace(ClientContext &context, T
 }
 
 static void RegisterHoltParquetScan(ExtensionLoader &loader) {
-	TableFunction function("holt_parquet_scan", {LogicalType::VARCHAR}, nullptr, nullptr);
+	TableFunction function("holt_parquet_scan", {LogicalType(LogicalTypeId::VARCHAR)}, nullptr, nullptr);
 	function.bind_replace = HoltParquetScanBindReplace;
-	function.named_parameters["mode"] = LogicalType::VARCHAR;
-	function.named_parameters["prefix"] = LogicalType::VARCHAR;
-	function.named_parameters["start_after"] = LogicalType::VARCHAR;
-	function.named_parameters["max_files"] = LogicalType::UBIGINT;
-	function.named_parameters["filename"] = LogicalType::ANY;
-	function.named_parameters["hive_partitioning"] = LogicalType::BOOLEAN;
-	function.named_parameters["union_by_name"] = LogicalType::BOOLEAN;
+	function.named_parameters["mode"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["prefix"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["start_after"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["max_files"] = LogicalType(LogicalTypeId::UBIGINT);
+	function.named_parameters["filename"] = LogicalType(LogicalTypeId::ANY);
+	function.named_parameters["hive_partitioning"] = LogicalType(LogicalTypeId::BOOLEAN);
+	function.named_parameters["union_by_name"] = LogicalType(LogicalTypeId::BOOLEAN);
 	loader.RegisterFunction(function);
 }
 
@@ -1280,27 +1281,27 @@ static unique_ptr<FunctionData> HoltfsStatusBind(ClientContext &, TableFunctionB
 	ReadStatusNamedParameters(input, *result);
 
 	names.emplace_back("index_ref");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("mode");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("has_manifest");
-	return_types.emplace_back(LogicalType::BOOLEAN);
+	return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
 	names.emplace_back("source_path");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("source_exists");
-	return_types.emplace_back(LogicalType::BOOLEAN);
+	return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
 	names.emplace_back("indexed_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("indexed_bytes");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("built_at_us");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("refreshed_at_us");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("age_seconds");
-	return_types.emplace_back(LogicalType::DOUBLE);
+	return_types.emplace_back(LogicalType(LogicalTypeId::DOUBLE));
 	names.emplace_back("is_stale");
-	return_types.emplace_back(LogicalType::BOOLEAN);
+	return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
 
 	return std::move(result);
 }
@@ -1360,10 +1361,10 @@ static void HoltfsStatusFunction(ClientContext &context, TableFunctionInput &inp
 }
 
 static void RegisterHoltfsStatus(ExtensionLoader &loader) {
-	TableFunction function("holtfs_status", {LogicalType::VARCHAR}, HoltfsStatusFunction, HoltfsStatusBind,
-	                       HoltfsStatusInit);
-	function.named_parameters["mode"] = LogicalType::VARCHAR;
-	function.named_parameters["max_age_seconds"] = LogicalType::UBIGINT;
+	TableFunction function("holtfs_status", {LogicalType(LogicalTypeId::VARCHAR)}, HoltfsStatusFunction,
+	                       HoltfsStatusBind, HoltfsStatusInit);
+	function.named_parameters["mode"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["max_age_seconds"] = LogicalType(LogicalTypeId::UBIGINT);
 	loader.RegisterFunction(function);
 }
 
@@ -1403,23 +1404,23 @@ static unique_ptr<FunctionData> HoltfsRefreshBind(ClientContext &, TableFunction
 	ReadRefreshNamedParameters(input, *result);
 
 	names.emplace_back("source_path");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("mode");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("index_ref");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("refresh_path");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("refreshed_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("refreshed_bytes");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("removed_keys");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("indexed_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("indexed_bytes");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 
 	return std::move(result);
 }
@@ -1676,15 +1677,16 @@ static void HoltfsRefreshFunction(ClientContext &context, TableFunctionInput &in
 }
 
 static void RegisterHoltfsRefresh(ExtensionLoader &loader) {
-	TableFunction function("holtfs_refresh", {LogicalType::VARCHAR, LogicalType::VARCHAR}, HoltfsRefreshFunction,
-	                       HoltfsRefreshBind, HoltfsRefreshInit);
-	function.named_parameters["mode"] = LogicalType::VARCHAR;
-	function.named_parameters["prefix"] = LogicalType::VARCHAR;
+	TableFunction function("holtfs_refresh", {LogicalType(LogicalTypeId::VARCHAR), LogicalType(LogicalTypeId::VARCHAR)},
+	                       HoltfsRefreshFunction, HoltfsRefreshBind, HoltfsRefreshInit);
+	function.named_parameters["mode"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["prefix"] = LogicalType(LogicalTypeId::VARCHAR);
 	loader.RegisterFunction(function);
 
-	TableFunction rebuild_function("holtfs_rebuild", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	TableFunction rebuild_function("holtfs_rebuild",
+	                               {LogicalType(LogicalTypeId::VARCHAR), LogicalType(LogicalTypeId::VARCHAR)},
 	                               HoltfsRefreshFunction, HoltfsRefreshBind, HoltfsRefreshInit);
-	rebuild_function.named_parameters["mode"] = LogicalType::VARCHAR;
+	rebuild_function.named_parameters["mode"] = LogicalType(LogicalTypeId::VARCHAR);
 	loader.RegisterFunction(rebuild_function);
 }
 
@@ -1732,27 +1734,27 @@ static unique_ptr<FunctionData> HoltfsValidateBind(ClientContext &, TableFunctio
 	ReadValidateNamedParameters(input, *result);
 
 	names.emplace_back("source_path");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("mode");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("index_ref");
-	return_types.emplace_back(LogicalType::VARCHAR);
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 	names.emplace_back("source_exists");
-	return_types.emplace_back(LogicalType::BOOLEAN);
+	return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
 	names.emplace_back("source_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("indexed_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("matched_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("changed_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("missing_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("deleted_files");
-	return_types.emplace_back(LogicalType::UBIGINT);
+	return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 	names.emplace_back("is_current");
-	return_types.emplace_back(LogicalType::BOOLEAN);
+	return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
 
 	return std::move(result);
 }
@@ -1840,14 +1842,15 @@ static void HoltfsValidateFunction(ClientContext &context, TableFunctionInput &i
 }
 
 static void RegisterHoltfsValidate(ExtensionLoader &loader) {
-	TableFunction function("holtfs_validate", {LogicalType::VARCHAR, LogicalType::VARCHAR}, HoltfsValidateFunction,
-	                       HoltfsValidateBind, HoltfsValidateInit);
-	function.named_parameters["mode"] = LogicalType::VARCHAR;
+	TableFunction function("holtfs_validate",
+	                       {LogicalType(LogicalTypeId::VARCHAR), LogicalType(LogicalTypeId::VARCHAR)},
+	                       HoltfsValidateFunction, HoltfsValidateBind, HoltfsValidateInit);
+	function.named_parameters["mode"] = LogicalType(LogicalTypeId::VARCHAR);
 	loader.RegisterFunction(function);
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	ScalarFunction version_function("holtfs_version", {}, LogicalType::VARCHAR, HoltfsVersionFunction);
+	ScalarFunction version_function("holtfs_version", {}, LogicalType(LogicalTypeId::VARCHAR), HoltfsVersionFunction);
 	loader.RegisterFunction(version_function);
 	RegisterHoltfsIndex(loader);
 	RegisterHoltfsStatus(loader);
